@@ -89,7 +89,7 @@ class GatingNetwork(nn.Module):
 
 class SimpleSGLR(nn.Module):
     """
-    Simplistic version of Self-Gated Latent Recurrence for MNIST
+    Simplistic version of Self-Gated Latent Reasoning for MNIST
     """
     def __init__(self, input_dim=784, hidden_dim=1024, num_experts=4, num_classes=10):
         super().__init__()
