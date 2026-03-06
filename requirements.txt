@@ -1,0 +1,10 @@
+matplotlib
+networkx
+numpy
+pandas
+streamlit
+torch
+torchinfo
+torchvision
+transformers
+tqdm

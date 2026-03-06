@@ -1,5 +1,8 @@
 
 /data
+/runs
+.streamlit/
+__pycache__/
 *.pyc
 *.png
 *.gif
