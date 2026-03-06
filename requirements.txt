@@ -6,5 +6,5 @@ streamlit
 torch
 torchinfo
 torchvision
-transformers
+transformers==4.57.6
 tqdm
