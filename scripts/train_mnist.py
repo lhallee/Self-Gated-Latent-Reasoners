@@ -20,8 +20,8 @@ def main() -> None:
     print(f"Run directory: {run_dir}")
     print(
         f"Microbatch size: {training_config.batch_size} | "
-        f"Grad accum: {training_config.grad_accum_steps} | "
-        f"Effective batch size: {training_config.batch_size * training_config.grad_accum_steps}"
+        f"Grad accum: {training_config.grad_accum} | "
+        f"Effective batch size: {training_config.batch_size * training_config.grad_accum}"
     )
 
     train_loader, eval_loader = build_mnist_dataloaders(

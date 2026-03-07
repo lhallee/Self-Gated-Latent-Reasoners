@@ -96,7 +96,7 @@ def run_epoch(
     scheduler,
     device: torch.device,
     load_balancing_coef: float,
-    grad_accum_steps: int,
+    grad_accum: int,
     log_interval: int,
     train_mode: bool,
     max_batches: int = 0,
@@ -132,7 +132,7 @@ def run_epoch(
             if train_mode:
                 accumulation_outputs.append(output)
                 accumulation_labels.append(label_batch)
-                should_step = batch_index % grad_accum_steps == 0 or batch_index == total_batches
+                should_step = batch_index % grad_accum == 0 or batch_index == total_batches
                 if should_step:
                     combined_logits, combined_labels, combined_route_probs, combined_active_mask = combine_outputs_for_loss(
                         outputs=accumulation_outputs,
@@ -203,8 +203,8 @@ def train_model(
     device: torch.device,
 ) -> dict[str, list[float]]:
     stage_path = Path(stage_dir)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=training_config.learning_rate, weight_decay=training_config.weight_decay)
-    optimizer_steps_per_epoch = max(1, math.ceil(len(train_loader) / training_config.grad_accum_steps))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=training_config.lr, weight_decay=training_config.weight_decay)
+    optimizer_steps_per_epoch = max(1, math.ceil(len(train_loader) / training_config.grad_accum))
     total_training_steps = max(1, training_config.epochs * optimizer_steps_per_epoch)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
@@ -237,7 +237,7 @@ def train_model(
             scheduler=scheduler,
             device=device,
             load_balancing_coef=training_config.load_balancing_coef,
-            grad_accum_steps=training_config.grad_accum_steps,
+            grad_accum=training_config.grad_accum,
             log_interval=training_config.log_interval,
             train_mode=True,
             max_batches=0,
@@ -249,7 +249,7 @@ def train_model(
             scheduler=None,
             device=device,
             load_balancing_coef=training_config.load_balancing_coef,
-            grad_accum_steps=1,
+            grad_accum=1,
             log_interval=training_config.log_interval,
             train_mode=False,
             max_batches=training_config.eval_batches,

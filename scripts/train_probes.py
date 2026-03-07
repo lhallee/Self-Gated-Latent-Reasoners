@@ -22,8 +22,8 @@ def main() -> None:
     print(f"Base run directory: {run_dir}")
     print(
         f"Probe microbatch size: {probe_config.batch_size} | "
-        f"Grad accum: {probe_config.grad_accum_steps} | "
-        f"Effective batch size: {probe_config.batch_size * probe_config.grad_accum_steps}"
+        f"Grad accum: {probe_config.grad_accum} | "
+        f"Effective batch size: {probe_config.batch_size * probe_config.grad_accum}"
     )
 
     backbone = SGLRModel(model_config).to(device)

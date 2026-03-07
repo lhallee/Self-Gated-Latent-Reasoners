@@ -177,7 +177,7 @@ def run_probe_epoch(
                 accumulation_classifier_losses.append(classifier_loss)
                 accumulation_reconstruction_losses.append(reconstruction_loss)
                 accumulation_visited_positions.append(visited_positions)
-                should_step = batch_index % probe_config.grad_accum_steps == 0 or batch_index == total_batches
+                should_step = batch_index % probe_config.grad_accum == 0 or batch_index == total_batches
                 if should_step:
                     total_loss_window, classifier_loss_window, reconstruction_loss_window, total_positions_window = combine_probe_window(
                         classifier_losses=accumulation_classifier_losses,
@@ -238,8 +238,8 @@ def train_probes(
     device: torch.device,
 ) -> dict[str, list[float]]:
     stage_path = Path(stage_dir)
-    optimizer = torch.optim.AdamW(probe_suite.parameters(), lr=probe_config.learning_rate, weight_decay=probe_config.weight_decay)
-    optimizer_steps_per_epoch = max(1, math.ceil(len(train_loader) / probe_config.grad_accum_steps))
+    optimizer = torch.optim.AdamW(probe_suite.parameters(), lr=probe_config.lr, weight_decay=probe_config.weight_decay)
+    optimizer_steps_per_epoch = max(1, math.ceil(len(train_loader) / probe_config.grad_accum))
     total_training_steps = max(1, probe_config.epochs * optimizer_steps_per_epoch)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
