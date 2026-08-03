@@ -1,10 +1,4 @@
-matplotlib
-networkx
-numpy
-pandas
-streamlit
-torch
-torchinfo
-torchvision
-transformers==4.57.6
-tqdm
+torch>=2.4,<3
+torchvision>=0.19,<1
+numpy>=1.26,<3
+matplotlib>=3.8,<4

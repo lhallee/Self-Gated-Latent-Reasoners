@@ -1,347 +1,465 @@
+"""Training orchestration for reproducible SGLR MNIST experiments."""
+
 from __future__ import annotations
 
-import copy
+import hashlib
 import math
+import os
 import random
-from dataclasses import asdict
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Dataset, Subset
-from tqdm import tqdm
-from transformers import get_cosine_schedule_with_warmup
+import torch.nn.functional as F
+from torch import Tensor
+from torch.utils.data import DataLoader
 
-from sglr.analysis import collect_digit_route_sequences, flatten_images, summarize_top_routes
-from sglr.artifacts import plot_digit_route_patterns, plot_training_curves, save_checkpoint, save_json
-from sglr.config import ModelConfig, TrainingConfig
-from sglr.router import load_balancing_loss
+from sglr.artifacts import (
+    build_run_manifest,
+    ensure_directory,
+    load_checkpoint,
+    run_directory,
+    save_checkpoint,
+    save_json,
+    validate_run_config,
+)
+from sglr.config import ExperimentConfig
+from sglr.data import MNISTDataLoaders, build_mnist_loaders
+from sglr.evaluation import evaluate_model
+from sglr.model import MNISTOutput, build_mnist_model, count_parameters
+from sglr.router import compute_penalty, load_balancing_loss
+
+
+@dataclass(frozen=True, slots=True)
+class EpochMetrics:
+    loss: float
+    cross_entropy: float
+    load_balance: float
+    compute_penalty: float
+    accuracy: float
+    mean_route_depth: float
+
+    def to_dict(self) -> dict[str, float]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingResult:
+    history: list[dict[str, object]]
+    best_epoch: int
+    best_validation_accuracy: float
+    elapsed_seconds: float
+    throughput_examples_per_second: float
+    peak_cuda_memory_bytes: int
 
 
 def seed_everything(seed: int) -> None:
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.benchmark = False
 
 
 def select_device(device_name: str) -> torch.device:
     if device_name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device_name)
+    device = torch.device(device_name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    return device
 
 
-def build_mnist_transforms():
-    return transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,)),
-        ]
-    )
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+    warmup_fraction: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    warmup_steps = int(total_steps * warmup_fraction)
+
+    def learning_rate_scale(step: int) -> float:
+        if warmup_steps and step < warmup_steps:
+            return (step + 1) / warmup_steps
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, (step - warmup_steps) / decay_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_scale)
 
 
-def maybe_subset_dataset(dataset: Dataset, subset_size: int) -> Dataset:
-    if subset_size <= 0:
-        return dataset
-    subset_size = min(subset_size, len(dataset))
-    return Subset(dataset, range(subset_size))
-
-
-def build_mnist_dataloaders(
-    data_root: str,
-    batch_size: int,
-    num_workers: int,
-    train_subset: int = 0,
-    test_subset: int = 0,
-) -> tuple[DataLoader, DataLoader]:
-    transform = build_mnist_transforms()
-    train_dataset = torchvision.datasets.MNIST(root=data_root, train=True, download=True, transform=transform)
-    test_dataset = torchvision.datasets.MNIST(root=data_root, train=False, download=True, transform=transform)
-    train_dataset = maybe_subset_dataset(train_dataset, train_subset)
-    test_dataset = maybe_subset_dataset(test_dataset, test_subset)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-    return train_loader, test_loader
-
-
-def count_parameter_count(model: nn.Module) -> int:
-    return sum(parameter.numel() for parameter in model.parameters())
-
-
-def summarize_route_depth(trace) -> float:
-    if trace.executed_steps == 0:
-        return 0.0
-    active_steps = trace.active_mask[: trace.executed_steps].sum(dim=0).float()
-    exit_choices = trace.route_ids[: trace.executed_steps] == trace.exit_route_index
-    expert_steps = active_steps - exit_choices.sum(dim=0).float()
-    return float(expert_steps.mean().item())
-
-
-def combine_outputs_for_loss(outputs: list, labels: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert outputs, "At least one model output is required to build an accumulation window"
-    assert labels, "At least one label tensor is required to build an accumulation window"
-    combined_logits = torch.cat([output.logits for output in outputs], dim=0)
-    combined_labels = torch.cat(labels, dim=0)
-    combined_route_probs = torch.cat([output.trace.route_probs for output in outputs], dim=1)
-    combined_active_mask = torch.cat([output.trace.active_mask for output in outputs], dim=1)
-    return combined_logits, combined_labels, combined_route_probs, combined_active_mask
+def _auxiliary_losses(
+    output: MNISTOutput,
+    variant: str,
+) -> tuple[Tensor, Tensor]:
+    zero = output.logits.sum() * 0.0  # ()
+    if variant in {"fixed_depth", "frozen_random"}:
+        return zero, zero
+    return load_balancing_loss(output.trace), compute_penalty(output.trace)
 
 
 def run_epoch(
     model: nn.Module,
     data_loader: DataLoader,
-    optimizer: torch.optim.Optimizer | None,
-    scheduler,
     device: torch.device,
-    load_balancing_coef: float,
-    grad_accum: int,
-    log_interval: int,
-    train_mode: bool,
-    max_batches: int = 0,
-) -> dict[str, float]:
-    if train_mode:
-        model.train()
-        assert optimizer is not None, "An optimizer is required for training"
+    variant: str,
+    load_balance_coefficient: float,
+    compute_penalty_coefficient: float,
+    optimizer: torch.optim.Optimizer | None = None,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    grad_accum_steps: int = 1,
+    log_interval: int = 0,
+) -> EpochMetrics:
+    training = optimizer is not None
+    model.train(training)
+    if training:
         optimizer.zero_grad(set_to_none=True)
-    else:
-        model.eval()
 
-    criterion = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    total_cross_entropy_loss = 0.0
-    total_load_balancing_loss = 0.0
-    total_correct = 0
     total_examples = 0
+    total_correct = 0
+    total_loss = 0.0
+    total_cross_entropy = 0.0
+    total_load_balance = 0.0
+    total_compute_penalty = 0.0
     total_route_depth = 0.0
-    mode_name = "Train" if train_mode else "Eval"
-    progress_bar = tqdm(data_loader, desc=mode_name, leave=False)
-    total_batches = len(data_loader) if max_batches == 0 else min(len(data_loader), max_batches)
-    accumulation_outputs: list = []
-    accumulation_labels: list[torch.Tensor] = []
-    latest_loss_value = 0.0
-    latest_accuracy_value = 0.0
+    total_batches = len(data_loader)
 
-    for batch_index, (images, labels) in enumerate(progress_bar, start=1):
-        image_batch = flatten_images(images).to(device)
-        label_batch = labels.to(device)
+    for batch_index, (images, labels, _) in enumerate(data_loader):
+        # images: (b, 1, 28, 28); labels: (b,)
+        images = images.to(device, non_blocking=True)  # (b, 1, 28, 28)
+        labels = labels.to(device, non_blocking=True)  # (b,)
+        with torch.set_grad_enabled(training):
+            output = model(images)
+            if not isinstance(output, MNISTOutput):
+                raise TypeError("MNIST training expects the model to return MNISTOutput")
+            cross_entropy = F.cross_entropy(output.logits, labels)  # ()
+            balance_loss, depth_loss = _auxiliary_losses(output, variant)
+            loss = (
+                cross_entropy
+                + load_balance_coefficient * balance_loss
+                + compute_penalty_coefficient * depth_loss
+            )  # ()
 
-        with torch.set_grad_enabled(train_mode):
-            output = model(image_batch)
-            if train_mode:
-                accumulation_outputs.append(output)
-                accumulation_labels.append(label_batch)
-                should_step = batch_index % grad_accum == 0 or batch_index == total_batches
-                if should_step:
-                    combined_logits, combined_labels, combined_route_probs, combined_active_mask = combine_outputs_for_loss(
-                        outputs=accumulation_outputs,
-                        labels=accumulation_labels,
-                    )
-                    classification_loss = criterion(combined_logits, combined_labels)
-                    balancing_loss = load_balancing_loss(combined_route_probs, combined_active_mask)
-                    loss = classification_loss + load_balancing_coef * balancing_loss
-                    loss.backward()
+            if training:
+                window_start = (batch_index // grad_accum_steps) * grad_accum_steps
+                window_size = min(grad_accum_steps, total_batches - window_start)
+                (loss / window_size).backward()
+                end_of_window = (batch_index + 1) % grad_accum_steps == 0
+                final_batch = batch_index + 1 == total_batches
+                if end_of_window or final_batch:
                     optimizer.step()
                     if scheduler is not None:
                         scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
-                    accumulation_example_count = combined_labels.size(0)
-                    total_loss += float(loss.item()) * accumulation_example_count
-                    total_cross_entropy_loss += float(classification_loss.item()) * accumulation_example_count
-                    total_load_balancing_loss += float(balancing_loss.item()) * accumulation_example_count
-                    latest_loss_value = float(loss.item())
-                    latest_accuracy_value = 100.0 * total_correct / total_examples
-                    accumulation_outputs.clear()
-                    accumulation_labels.clear()
-            else:
-                route_probs = output.trace.route_probs[: output.trace.executed_steps]
-                active_mask = output.trace.active_mask[: output.trace.executed_steps]
-                classification_loss = criterion(output.logits, label_batch)
-                balancing_loss = load_balancing_loss(route_probs, active_mask)
-                loss = classification_loss + load_balancing_coef * balancing_loss
-                total_loss += float(loss.item()) * label_batch.size(0)
-                total_cross_entropy_loss += float(classification_loss.item()) * label_batch.size(0)
-                total_load_balancing_loss += float(balancing_loss.item()) * label_batch.size(0)
-                latest_loss_value = float(loss.item())
+        b = labels.size(0)
+        predictions = output.logits.argmax(dim=-1)  # (b,)
+        total_examples += b
+        total_correct += int(predictions.eq(labels).sum().item())
+        total_loss += float(loss.detach().item()) * b
+        total_cross_entropy += float(cross_entropy.detach().item()) * b
+        total_load_balance += float(balance_loss.detach().item()) * b
+        total_compute_penalty += float(depth_loss.detach().item()) * b
+        total_route_depth += float(output.trace.route_depth.float().sum().item())
 
-        predictions = output.logits.argmax(dim=-1)
-        batch_size = label_batch.size(0)
-        total_examples += batch_size
-        total_correct += int(predictions.eq(label_batch).sum().item())
-        total_route_depth += summarize_route_depth(output.trace) * batch_size
-        latest_accuracy_value = 100.0 * total_correct / total_examples
-
-        if batch_index % log_interval == 0 or batch_index == total_batches:
-            progress_bar.set_postfix(
-                {
-                    "loss": f"{latest_loss_value:.4f}",
-                    "acc": f"{latest_accuracy_value:.2f}",
-                }
+        if log_interval and ((batch_index + 1) % log_interval == 0 or batch_index + 1 == total_batches):
+            accuracy = total_correct / total_examples
+            print(
+                f"  batch {batch_index + 1}/{total_batches} "
+                f"loss={total_loss / total_examples:.4f} accuracy={accuracy:.3f}"
             )
 
-        if batch_index >= total_batches:
-            break
-
-    return {
-        "loss": total_loss / total_examples,
-        "cross_entropy_loss": total_cross_entropy_loss / total_examples,
-        "load_balancing_loss": total_load_balancing_loss / total_examples,
-        "accuracy": 100.0 * total_correct / total_examples,
-        "route_depth": total_route_depth / total_examples,
-    }
+    if total_examples == 0:
+        raise ValueError("Data loader produced no examples")
+    return EpochMetrics(
+        loss=total_loss / total_examples,
+        cross_entropy=total_cross_entropy / total_examples,
+        load_balance=total_load_balance / total_examples,
+        compute_penalty=total_compute_penalty / total_examples,
+        accuracy=total_correct / total_examples,
+        mean_route_depth=total_route_depth / total_examples,
+    )
 
 
 def train_model(
     model: nn.Module,
-    model_config: ModelConfig,
-    training_config: TrainingConfig,
-    train_loader: DataLoader,
-    eval_loader: DataLoader,
-    stage_dir: str | Path,
+    experiment: ExperimentConfig,
+    loaders: MNISTDataLoaders,
     device: torch.device,
-) -> dict[str, list[float]]:
-    stage_path = Path(stage_dir)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=training_config.lr, weight_decay=training_config.weight_decay)
-    optimizer_steps_per_epoch = max(1, math.ceil(len(train_loader) / training_config.grad_accum))
-    total_training_steps = max(1, training_config.epochs * optimizer_steps_per_epoch)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=min(training_config.warmup_steps, total_training_steps),
-        num_training_steps=total_training_steps,
+    run_path: Path,
+) -> TrainingResult:
+    config = experiment.training
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable_parameters,
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    optimizer_steps_per_epoch = math.ceil(len(loaders.train) / config.grad_accum_steps)
+    scheduler = build_scheduler(
+        optimizer,
+        total_steps=max(1, config.epochs * optimizer_steps_per_epoch),
+        warmup_fraction=config.warmup_fraction,
     )
 
-    history = {
-        "epochs": [],
-        "train_loss": [],
-        "train_accuracy": [],
-        "train_route_depth": [],
-        "eval_loss": [],
-        "eval_accuracy": [],
-        "eval_route_depth": [],
-    }
-    best_eval_accuracy = -1.0
-    best_state_dict = None
+    last_state_path = run_path / "last_state.pt"
+    best_weights_path = run_path / "best_model.pt"
+    history: list[dict[str, object]] = []
+    start_epoch = 1
+    best_epoch = 0
+    best_validation_accuracy = -1.0
     patience_counter = 0
+    previous_elapsed_seconds = 0.0
+    previous_peak_memory = 0
+    if last_state_path.is_file():
+        state = load_checkpoint(last_state_path, device)
+        model.load_state_dict(state["model_state"])
+        optimizer.load_state_dict(state["optimizer_state"])
+        scheduler.load_state_dict(state["scheduler_state"])
+        history = list(state["history"])
+        start_epoch = int(state["epoch"]) + 1
+        best_epoch = int(state["best_epoch"])
+        best_validation_accuracy = float(state["best_validation_accuracy"])
+        patience_counter = int(state["patience_counter"])
+        previous_elapsed_seconds = float(state.get("elapsed_seconds", 0.0))
+        previous_peak_memory = int(state.get("training_peak_cuda_memory_bytes", 0))
+        _restore_rng_state(state["rng_state"], loaders.train_generator)
+        print(f"Resuming {run_path} at epoch {start_epoch}")
 
-    save_json(stage_path / "model_config.json", asdict(model_config))
-    save_json(stage_path / "training_config.json", asdict(training_config))
-
-    for epoch_index in range(1, training_config.epochs + 1):
-        print(f"Epoch {epoch_index}/{training_config.epochs}")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    training_start = time.perf_counter()
+    for epoch in range(start_epoch, config.epochs + 1):
+        if patience_counter >= config.patience:
+            break
+        print(f"Epoch {epoch}/{config.epochs}")
         train_metrics = run_epoch(
             model=model,
-            data_loader=train_loader,
+            data_loader=loaders.train,
+            device=device,
+            variant=experiment.model.routing_mode,
+            load_balance_coefficient=config.load_balance_coefficient,
+            compute_penalty_coefficient=config.compute_penalty_coefficient,
             optimizer=optimizer,
             scheduler=scheduler,
-            device=device,
-            load_balancing_coef=training_config.load_balancing_coef,
-            grad_accum=training_config.grad_accum,
-            log_interval=training_config.log_interval,
-            train_mode=True,
-            max_batches=0,
+            grad_accum_steps=config.grad_accum_steps,
+            log_interval=config.log_interval,
         )
-        eval_metrics = run_epoch(
+        validation_metrics = run_epoch(
             model=model,
-            data_loader=eval_loader,
-            optimizer=None,
-            scheduler=None,
+            data_loader=loaders.validation,
             device=device,
-            load_balancing_coef=training_config.load_balancing_coef,
-            grad_accum=1,
-            log_interval=training_config.log_interval,
-            train_mode=False,
-            max_batches=training_config.eval_batches,
+            variant=experiment.model.routing_mode,
+            load_balance_coefficient=config.load_balance_coefficient,
+            compute_penalty_coefficient=config.compute_penalty_coefficient,
         )
-
-        history["epochs"].append(epoch_index)
-        history["train_loss"].append(train_metrics["loss"])
-        history["train_accuracy"].append(train_metrics["accuracy"])
-        history["train_route_depth"].append(train_metrics["route_depth"])
-        history["eval_loss"].append(eval_metrics["loss"])
-        history["eval_accuracy"].append(eval_metrics["accuracy"])
-        history["eval_route_depth"].append(eval_metrics["route_depth"])
-
+        history.append(
+            {
+                "epoch": epoch,
+                "train": train_metrics.to_dict(),
+                "validation": validation_metrics.to_dict(),
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            }
+        )
+        save_json(run_path / "training_history.json", {"epochs": history})
         print(
-            "  "
-            f"[Train] Loss: {train_metrics['loss']:.4f} | Acc: {train_metrics['accuracy']:.2f}% | Depth: {train_metrics['route_depth']:.2f}"
-        )
-        print(
-            "  "
-            f"[Eval]  Loss: {eval_metrics['loss']:.4f} | Acc: {eval_metrics['accuracy']:.2f}% | Depth: {eval_metrics['route_depth']:.2f}"
+            f"  train accuracy={train_metrics.accuracy:.3f} "
+            f"validation accuracy={validation_metrics.accuracy:.3f} "
+            f"depth={validation_metrics.mean_route_depth:.2f}"
         )
 
-        checkpoint_payload = {
-            "epoch": epoch_index,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict(),
-            "history": history,
-            "model_config": asdict(model_config),
-            "training_config": asdict(training_config),
-            "expert_names": list(model.expert_names),
-        }
-        save_checkpoint(stage_path / "last_model.pt", checkpoint_payload)
-        save_json(stage_path / "training_history.json", history)
-
-        if eval_metrics["accuracy"] > best_eval_accuracy:
-            best_eval_accuracy = eval_metrics["accuracy"]
-            best_state_dict = copy.deepcopy(model.state_dict())
+        if validation_metrics.accuracy > best_validation_accuracy:
+            best_validation_accuracy = validation_metrics.accuracy
+            best_epoch = epoch
             patience_counter = 0
-            save_checkpoint(stage_path / "best_model.pt", checkpoint_payload)
+            save_checkpoint(
+                best_weights_path,
+                {
+                    "model_state": model.state_dict(),
+                    "epoch": epoch,
+                    "validation_accuracy": best_validation_accuracy,
+                },
+            )
         else:
             patience_counter += 1
-            if patience_counter >= training_config.patience:
-                print(f"Early stopping triggered after epoch {epoch_index}.")
-                break
 
-    assert best_state_dict is not None, "Training never produced a best checkpoint"
-    model.load_state_dict(best_state_dict)
-    plot_training_curves(history, stage_path / "training_curves.png")
-    save_json(
-        stage_path / "training_summary.json",
+        save_checkpoint(
+            last_state_path,
+            {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "epoch": epoch,
+                "history": history,
+                "best_epoch": best_epoch,
+                "best_validation_accuracy": best_validation_accuracy,
+                "patience_counter": patience_counter,
+                "elapsed_seconds": previous_elapsed_seconds + time.perf_counter() - training_start,
+                "rng_state": _capture_rng_state(loaders.train_generator),
+                "training_peak_cuda_memory_bytes": max(
+                    previous_peak_memory,
+                    int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0,
+                ),
+            },
+        )
+
+    elapsed_seconds = previous_elapsed_seconds + time.perf_counter() - training_start
+    if not best_weights_path.is_file():
+        raise RuntimeError("Training did not produce a best checkpoint")
+    best_checkpoint = load_checkpoint(best_weights_path, device)
+    model.load_state_dict(best_checkpoint["model_state"])
+    examples_seen = len(loaders.train_indices) * len(history)
+    throughput = examples_seen / max(elapsed_seconds, 1e-12)
+    current_peak_memory = int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else 0
+    peak_memory = max(previous_peak_memory, current_peak_memory)
+    return TrainingResult(
+        history,
+        best_epoch,
+        best_validation_accuracy,
+        elapsed_seconds,
+        throughput,
+        peak_memory,
+    )
+
+
+def run_experiment(
+    experiment: ExperimentConfig,
+    experiment_name: str,
+    download: bool = False,
+    command: list[str] | None = None,
+) -> Path:
+    experiment.validate()
+    seed_everything(experiment.training.seed)
+    device = select_device(experiment.training.device)
+    variant = experiment.model.routing_mode
+    run_path = ensure_directory(
+        run_directory(
+            experiment.training.output_root,
+            experiment_name,
+            variant,
+            experiment.training.seed,
+        )
+    )
+    manifest_path = run_path / "manifest.json"
+    if manifest_path.is_file():
+        validate_run_config(run_path, experiment)
+    loaders = build_mnist_loaders(experiment.training, download=download)
+    model = build_mnist_model(experiment.model).to(device)
+
+    total_parameters = count_parameters(model)
+    trainable_parameters = count_parameters(model, trainable_only=True)
+    if variant != "fixed_depth" and total_parameters >= 200_000:
+        raise ValueError(f"Primary SGLR model exceeds the 200,000 parameter budget: {total_parameters:,}")
+    if variant != "fixed_depth":
+        router_parameters = count_parameters(model.core.routers)
+        expert_parameters = count_parameters(model.core.experts)
+        if router_parameters > expert_parameters:
+            raise ValueError(
+                f"Router pool ({router_parameters:,}) outweighs expert pool ({expert_parameters:,})"
+            )
+
+    manifest = build_run_manifest(
+        experiment=experiment,
+        variant=variant,
+        seed=experiment.training.seed,
+        device=device,
+        run_path=run_path,
+        command=command,
+    )
+    manifest.update(
         {
-            "best_eval_accuracy": best_eval_accuracy,
-            "parameter_count": count_parameter_count(model),
-            "max_steps": model_config.max_steps,
+            "expert_names": list(model.expert_names),
+            "total_parameters": total_parameters,
+            "trainable_parameters": trainable_parameters,
+            "data_splits": {
+                "train_size": len(loaders.train_indices),
+                "validation_size": len(loaders.validation_indices),
+                "test_size": len(loaders.test_indices),
+                "train_index_sha256": _index_digest(loaders.train_indices),
+                "validation_index_sha256": _index_digest(loaders.validation_indices),
+                "test_index_sha256": _index_digest(loaders.test_indices),
+            },
+        }
+    )
+    save_json(manifest_path, manifest)
+
+    print(f"Device: {device}")
+    print(f"Run: {run_path}")
+    print(f"Parameters: {total_parameters:,} total, {trainable_parameters:,} trainable")
+    training_result = train_model(model, experiment, loaders, device, run_path)
+    evaluation_summary = evaluate_model(
+        model=model,
+        data_loader=loaders.test,
+        device=device,
+        output_directory=run_path,
+        num_classes=experiment.model.num_classes,
+    )
+    evaluation_summary.update(
+        {
+            "variant": variant,
+            "seed": experiment.training.seed,
+            "total_parameters": total_parameters,
+            "trainable_parameters": trainable_parameters,
+            "best_epoch": training_result.best_epoch,
+            "best_validation_accuracy": training_result.best_validation_accuracy,
+            "training_elapsed_seconds": training_result.elapsed_seconds,
+            "training_throughput_examples_per_second": training_result.throughput_examples_per_second,
+            "training_peak_cuda_memory_bytes": training_result.peak_cuda_memory_bytes,
+        }
+    )
+    save_json(run_path / "evaluation_summary.json", evaluation_summary)
+
+    manifest.update(
+        {
+            "training_elapsed_seconds": training_result.elapsed_seconds,
+            "training_throughput_examples_per_second": training_result.throughput_examples_per_second,
+            "training_peak_cuda_memory_bytes": training_result.peak_cuda_memory_bytes,
+            "evaluation": evaluation_summary,
+            "best_epoch": training_result.best_epoch,
+            "best_validation_accuracy": training_result.best_validation_accuracy,
+            "checkpoints": {
+                "best_model": str((run_path / "best_model.pt").resolve()),
+                "last_state": str((run_path / "last_state.pt").resolve()),
+            },
+        }
+    )
+    save_json(manifest_path, manifest)
+    save_json(
+        run_path / "run_complete.json",
+        {
+            "schema_version": experiment.schema_version,
+            "variant": variant,
+            "seed": experiment.training.seed,
+            "summary": "evaluation_summary.json",
         },
     )
-    return history
+    return run_path
 
 
-def save_route_artifacts(
-    model,
-    data_loader: DataLoader,
-    device: torch.device,
-    stage_dir: str | Path,
-    max_samples: int,
-) -> None:
-    stage_path = Path(stage_dir)
-    digit_to_sequences = collect_digit_route_sequences(model=model, data_loader=data_loader, device=device, max_samples=max_samples)
-    route_summary = summarize_top_routes(digit_to_sequences, model.route_name)
-    save_json(stage_path / "digit_route_summary.json", route_summary)
-    plot_digit_route_patterns(
-        digit_to_sequences=digit_to_sequences,
-        output_path=stage_path / "digit_usage_patterns.png",
-        route_name_fn=model.route_name,
-    )
+def _index_digest(indices: tuple[int, ...]) -> str:
+    encoded = ",".join(str(index) for index in sorted(indices)).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def save_reconstruction_preview(
-    image_tensor: torch.Tensor,
-    reconstruction_tensor: torch.Tensor,
-    output_path: str | Path,
-) -> None:
-    output_path_obj = Path(output_path)
-    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
-    figure, axes = plt.subplots(1, 2, figsize=(4, 2))
-    axes[0].imshow(image_tensor.view(28, 28).cpu(), cmap="gray")
-    axes[0].set_title("Input")
-    axes[0].axis("off")
-    axes[1].imshow(reconstruction_tensor.view(28, 28).cpu(), cmap="gray")
-    axes[1].set_title("Probe")
-    axes[1].axis("off")
-    figure.tight_layout()
-    figure.savefig(output_path_obj, dpi=300)
-    plt.close(figure)
+def _capture_rng_state(train_generator: torch.Generator) -> dict[str, object]:
+    state: dict[str, object] = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+        "train_loader": train_generator.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: object, train_generator: torch.Generator) -> None:
+    if not isinstance(state, dict):
+        raise ValueError("Checkpoint RNG state must be a mapping")
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch"])
+    train_generator.set_state(state["train_loader"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])

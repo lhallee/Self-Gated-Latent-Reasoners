@@ -1,8 +1,26 @@
+/data/
+/runs/
+/.streamlit/
 
-/data
-/runs
-.streamlit/
 __pycache__/
-*.pyc
-*.png
-*.gif
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+
+# Generated analysis output is reproducible from run artifacts. Curated PNGs
+# placed under docs/figures remain eligible for version control.
+/figures/generated/
+
+# Historical local outputs remain ignored in place.
+/digit_usage_patterns.png
+/training_curves.png
+/signal_propagation.gif
+/signal_propagation_long.gif

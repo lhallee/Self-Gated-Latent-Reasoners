@@ -1,65 +1,62 @@
+"""Train or resume one SGLR MNIST experiment."""
+
 from __future__ import annotations
 
-from dataclasses import asdict
+import argparse
+import sys
+from dataclasses import replace
 from pathlib import Path
 
-from sglr.artifacts import create_run_directory, ensure_directory, save_json
-from sglr.config import parse_train_configs
-from sglr.model import SGLRModel
-from sglr.train import build_mnist_dataloaders, count_parameter_count, save_route_artifacts, seed_everything, select_device, train_model
+from sglr.artifacts import run_directory, run_is_complete, validate_run_config
+from sglr.config import ROUTING_MODES, load_experiment_config, with_run_overrides
+from sglr.train import run_experiment
 
 
-def main() -> None:
-    model_config, training_config = parse_train_configs()
-    seed_everything(training_config.seed)
-    device = select_device(training_config.device)
-    run_dir = create_run_directory(output_root=training_config.output_root, run_name=training_config.run_name)
-    base_stage_dir = ensure_directory(run_dir / "base")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Train one schema-versioned SGLR MNIST experiment.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--config", type=Path, required=True, help="TOML experiment configuration.")
+    parser.add_argument("--variant", choices=sorted(ROUTING_MODES), help="Override model.routing_mode.")
+    parser.add_argument("--seed", type=int, help="Override the configured random seed.")
+    parser.add_argument("--device", help="Override the configured Torch device.")
+    parser.add_argument("--download", action="store_true", help="Allow torchvision to download missing MNIST files.")
+    return parser
 
-    print(f"Using device: {device}")
-    print(f"Run directory: {run_dir}")
-    print(
-        f"Microbatch size: {training_config.batch_size} | "
-        f"Grad accum: {training_config.grad_accum} | "
-        f"Effective batch size: {training_config.batch_size * training_config.grad_accum}"
-    )
 
-    train_loader, eval_loader = build_mnist_dataloaders(
-        data_root=training_config.data_root,
-        batch_size=training_config.batch_size,
-        num_workers=training_config.num_workers,
-        train_subset=training_config.train_subset,
-        test_subset=training_config.test_subset,
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    experiment = with_run_overrides(
+        load_experiment_config(args.config),
+        routing_mode=args.variant,
+        seed=args.seed,
     )
-    model = SGLRModel(model_config).to(device)
-    print(f"Model parameters: {count_parameter_count(model):,}")
+    if args.device is not None:
+        experiment = replace(
+            experiment,
+            training=replace(experiment.training, device=args.device),
+        )
+    experiment_name = experiment.experiment_name
+    run_path = run_directory(
+        experiment.training.output_root,
+        experiment_name,
+        experiment.model.routing_mode,
+        experiment.training.seed,
+    )
+    if run_is_complete(run_path):
+        validate_run_config(run_path, experiment)
+        print(f"Completed run already exists: {run_path}")
+        return
 
-    train_model(
-        model=model,
-        model_config=model_config,
-        training_config=training_config,
-        train_loader=train_loader,
-        eval_loader=eval_loader,
-        stage_dir=base_stage_dir,
-        device=device,
+    command = [sys.executable, "-m", "scripts.train_mnist", *(argv if argv is not None else sys.argv[1:])]
+    completed_path = run_experiment(
+        experiment=experiment,
+        experiment_name=experiment_name,
+        download=args.download,
+        command=command,
     )
-    save_route_artifacts(
-        model=model,
-        data_loader=eval_loader,
-        device=device,
-        stage_dir=base_stage_dir,
-        max_samples=training_config.plot_max_samples,
-    )
-    save_json(
-        run_dir / "run_manifest.json",
-        {
-            "run_dir": str(run_dir),
-            "base_stage_dir": str(base_stage_dir),
-            "model_config": asdict(model_config),
-            "training_config": asdict(training_config),
-        },
-    )
-    print(f"Finished base training. Artifacts are in {Path(run_dir)}")
+    print(f"Completed run: {completed_path}")
 
 
 if __name__ == "__main__":

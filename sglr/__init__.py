@@ -1,14 +1,34 @@
-from sglr.config import ModelConfig, ProbeTrainingConfig, TrainingConfig
-from sglr.model import SGLRModel, SGLROutput
-from sglr.probes import ExpertProbeSuite, ProbeInferenceOutput, run_probes_on_trace
+"""Self-Gated Latent Reasoners."""
+
+from sglr.config import (
+    ExperimentConfig,
+    ExpertSpec,
+    ModelConfig,
+    SweepConfig,
+    TrainingConfig,
+    load_experiment_config,
+)
+from sglr.model import (
+    MNISTSGLR,
+    MNISTOutput,
+    SGLRCore,
+    SGLRCoreOutput,
+    build_mnist_model,
+)
+from sglr.router import RoutingTrace
+
 
 __all__ = [
-    "ExpertProbeSuite",
+    "ExperimentConfig",
+    "ExpertSpec",
+    "MNISTSGLR",
+    "MNISTOutput",
     "ModelConfig",
-    "ProbeInferenceOutput",
-    "ProbeTrainingConfig",
-    "SGLRModel",
-    "SGLROutput",
+    "RoutingTrace",
+    "SGLRCore",
+    "SGLRCoreOutput",
+    "SweepConfig",
     "TrainingConfig",
-    "run_probes_on_trace",
+    "build_mnist_model",
+    "load_experiment_config",
 ]
