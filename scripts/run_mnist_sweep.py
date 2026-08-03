@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import replace
-from pathlib import Path
 
+from scripts.arguments import positive_int
 from sglr.artifacts import run_directory, run_is_complete, validate_run_config
-from sglr.config import load_experiment_config, with_run_overrides
+from sglr.config import with_run_overrides
+from sglr.presets.mnist import MNIST_PRESET_NAMES, get_mnist_preset
 from sglr.train import run_experiment
 
 
@@ -17,7 +18,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run a schema-versioned SGLR MNIST sweep.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", type=Path, required=True, help="TOML configuration containing [sweep].")
+    parser.add_argument("--preset", choices=MNIST_PRESET_NAMES, required=True)
+    parser.add_argument(
+        "--experts-per-family",
+        type=positive_int,
+        help="Override the selected preset's balanced expert-family count.",
+    )
     parser.add_argument("--device", help="Override the configured Torch device for every run.")
     parser.add_argument("--download", action="store_true", help="Allow the first run to download missing MNIST files.")
     return parser
@@ -25,9 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    base_experiment = load_experiment_config(args.config)
+    base_experiment = get_mnist_preset(
+        args.preset,
+        experts_per_family=args.experts_per_family,
+    )
     if base_experiment.sweep is None:
-        raise ValueError(f"Sweep configuration is missing [sweep]: {args.config}")
+        raise ValueError(f"Preset {args.preset!r} does not define a sweep")
     experiment_name = base_experiment.experiment_name
     completed = 0
     skipped = 0

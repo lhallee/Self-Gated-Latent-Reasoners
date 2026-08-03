@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn as nn
@@ -172,7 +172,8 @@ class SGLRCore(nn.Module):
             if step_index < self.config.min_steps:
                 exit_mask = torch.zeros_like(router_logits, dtype=torch.bool)  # (b, e + 1)
                 exit_mask[:, self.exit_route_index] = True
-                router_logits = router_logits.masked_fill(exit_mask, torch.finfo(router_logits.dtype).min)  # (b, e + 1)
+                minimum_logit = torch.finfo(router_logits.dtype).min
+                router_logits = router_logits.masked_fill(exit_mask, minimum_logit)  # (b, e + 1)
 
             route_probs = router_logits.softmax(dim=-1)  # (b, e + 1)
             hard_routes = route_probs.argmax(dim=-1)  # (b,)
@@ -425,11 +426,6 @@ def build_mnist_model(config: ModelConfig) -> nn.Module:
     if config.routing_mode != "fixed_depth":
         return MNISTSGLR(config)
 
-    routed_values = asdict(config)
-    routed_values["routing_mode"] = "straight_through"
-    routed_values["experts"] = [
-        spec if isinstance(spec, dict) else spec for spec in routed_values["experts"]
-    ]
-    routed_config = ModelConfig.from_dict(routed_values)
+    routed_config = replace(config, routing_mode="straight_through")
     target_parameter_count = count_parameters(MNISTSGLR(routed_config))
     return FixedDepthMNISTModel(config, target_parameter_count)

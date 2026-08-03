@@ -1,0 +1,202 @@
+"""MNIST presets and scalable heterogeneous expert-pool builders."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+
+from sglr.config import ExperimentConfig, ExpertSpec, ModelConfig, SweepConfig, TrainingConfig
+
+
+MLP_WIDTHS = (8, 12, 16, 24, 32, 48, 64, 96)
+ATTENTION_SHAPES = ((8, 1), (12, 1), (16, 1), (16, 2), (24, 2), (24, 3), (32, 4), (48, 6))
+CONV_TEMPLATES = (
+    ExpertSpec("conv_token_3", "conv", channels=2, kernel_size=(3, 1)),
+    ExpertSpec("conv_token_5", "conv", channels=2, kernel_size=(5, 1)),
+    ExpertSpec("conv_feature_3", "conv", channels=2, kernel_size=(1, 3)),
+    ExpertSpec("conv_feature_5", "conv", channels=2, kernel_size=(1, 5)),
+    ExpertSpec("conv_joint_3x3", "conv", channels=2, kernel_size=(3, 3)),
+    ExpertSpec("conv_joint_5x3", "conv", channels=3, kernel_size=(5, 3)),
+    ExpertSpec("conv_dilated_token", "conv", channels=2, kernel_size=(3, 1), dilation=(2, 1)),
+    ExpertSpec("conv_dilated_joint", "conv", channels=3, kernel_size=(3, 3), dilation=(2, 1)),
+)
+
+
+def make_expert_pool(
+    mlp_experts: int = 8,
+    attention_experts: int = 8,
+    conv_experts: int = 8,
+    dropout: float = 0.0,
+) -> tuple[ExpertSpec, ...]:
+    """Build any number of experts by cycling the canonical heterogeneous templates."""
+
+    counts = (mlp_experts, attention_experts, conv_experts)
+    if any(count < 0 for count in counts):
+        raise ValueError("Expert-family counts must be non-negative")
+    if sum(counts) == 0:
+        raise ValueError("At least one expert is required")
+
+    experts = (
+        *_make_mlp_experts(mlp_experts, dropout),
+        *_make_attention_experts(attention_experts, dropout),
+        *_make_conv_experts(conv_experts, dropout),
+    )
+    return tuple(experts)
+
+
+def _make_mlp_experts(count: int, dropout: float) -> list[ExpertSpec]:
+    experts: list[ExpertSpec] = []
+    for index in range(count):
+        width = MLP_WIDTHS[index % len(MLP_WIDTHS)]
+        base_name = f"mlp_{width:03d}"
+        experts.append(
+            ExpertSpec(
+                name=_repeated_name(base_name, index, len(MLP_WIDTHS)),
+                family="mlp",
+                hidden_size=width,
+                dropout=dropout,
+            )
+        )
+    return experts
+
+
+def _make_attention_experts(count: int, dropout: float) -> list[ExpertSpec]:
+    experts: list[ExpertSpec] = []
+    for index in range(count):
+        internal_size, num_heads = ATTENTION_SHAPES[index % len(ATTENTION_SHAPES)]
+        base_name = f"attention_{internal_size:03d}_h{num_heads}"
+        experts.append(
+            ExpertSpec(
+                name=_repeated_name(base_name, index, len(ATTENTION_SHAPES)),
+                family="attention",
+                internal_size=internal_size,
+                num_heads=num_heads,
+                dropout=dropout,
+            )
+        )
+    return experts
+
+
+def _make_conv_experts(count: int, dropout: float) -> list[ExpertSpec]:
+    experts: list[ExpertSpec] = []
+    for index in range(count):
+        template = CONV_TEMPLATES[index % len(CONV_TEMPLATES)]
+        experts.append(
+            replace(
+                template,
+                name=_repeated_name(template.name, index, len(CONV_TEMPLATES)),
+                dropout=dropout,
+            )
+        )
+    return experts
+
+
+def _repeated_name(base_name: str, index: int, template_count: int) -> str:
+    repetition = index // template_count
+    return base_name if repetition == 0 else f"{base_name}_r{repetition + 1:02d}"
+
+
+def smoke(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = pilot(experts_per_family=experts_per_family)
+    return replace(
+        experiment,
+        experiment_name="smoke",
+        training=replace(
+            experiment.training,
+            epochs=1,
+            batch_size=32,
+            patience=1,
+            train_size=256,
+            validation_size=128,
+            test_size=128,
+            log_interval=10,
+        ),
+    )
+
+
+def pilot(*, experts_per_family: int = 8) -> ExperimentConfig:
+    primary_pool = experts_per_family == 8
+    experiment = ExperimentConfig(
+        experiment_name="pilot",
+        model=ModelConfig(
+            experts=make_expert_pool(
+                mlp_experts=experts_per_family,
+                attention_experts=experts_per_family,
+                conv_experts=experts_per_family,
+            ),
+            parameter_budget=200_000 if primary_pool else None,
+            require_router_smaller_than_experts=primary_pool,
+        ),
+        training=TrainingConfig(
+            epochs=5,
+            batch_size=128,
+            learning_rate=3e-4,
+            weight_decay=1e-4,
+            warmup_fraction=0.05,
+            grad_accum_steps=1,
+            load_balance_coefficient=0.01,
+            compute_penalty_coefficient=0.001,
+            patience=3,
+            train_size=12_000,
+            validation_size=2_000,
+            test_size=0,
+            num_workers=0,
+            seed=7,
+            device="auto",
+            log_interval=50,
+        ),
+    )
+    experiment.validate()
+    return experiment
+
+
+def full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = pilot(experts_per_family=experts_per_family)
+    return replace(
+        experiment,
+        experiment_name="full",
+        training=replace(
+            experiment.training,
+            epochs=20,
+            patience=5,
+            train_size=50_000,
+            validation_size=10_000,
+            num_workers=4,
+        ),
+    )
+
+
+def focused(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = pilot(experts_per_family=experts_per_family)
+    return replace(
+        experiment,
+        experiment_name="focused",
+        sweep=SweepConfig(),
+    )
+
+
+MNIST_PRESETS = {
+    "smoke": smoke,
+    "pilot": pilot,
+    "full": full,
+    "focused": focused,
+}
+MNIST_PRESET_NAMES = tuple(MNIST_PRESETS)
+
+
+def get_mnist_preset(name: str, *, experts_per_family: int | None = None) -> ExperimentConfig:
+    try:
+        factory = MNIST_PRESETS[name]
+    except KeyError as error:
+        choices = ", ".join(MNIST_PRESET_NAMES)
+        raise ValueError(f"Unknown MNIST preset {name!r}; choose one of: {choices}") from error
+    if experts_per_family is None:
+        experiment = factory()
+    else:
+        experiment = factory(experts_per_family=experts_per_family)
+        if experiment.model.num_experts != 24 and experiment.experiment_name == name:
+            experiment = replace(
+                experiment,
+                experiment_name=f"{name}_{experiment.model.num_experts}_experts",
+            )
+    experiment.validate()
+    return experiment

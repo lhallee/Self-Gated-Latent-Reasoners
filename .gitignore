@@ -24,3 +24,5 @@ venv/
 /training_curves.png
 /signal_propagation.gif
 /signal_propagation_long.gif
+/archive/*.png
+/archive/*.gif

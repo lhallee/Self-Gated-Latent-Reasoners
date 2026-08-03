@@ -7,19 +7,22 @@ import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from scripts.arguments import positive_int
 from sglr.analysis import load_evaluation_records
 from sglr.artifacts import (
     build_run_manifest,
     ensure_directory,
     load_checkpoint,
     load_json,
+    require_manifest_for_resume,
     save_json,
 )
-from sglr.config import ExperimentConfig, load_experiment_config
+from sglr.config import ExperimentConfig, experiment_from_dict
 from sglr.data import build_mnist_loaders
 from sglr.evaluation import evaluate_model
 from sglr.figures import generate_run_figures, load_image_archive
 from sglr.model import build_mnist_model, count_parameters
+from sglr.presets.mnist import MNIST_PRESET_NAMES, get_mnist_preset
 from sglr.train import seed_everything, select_device, train_model
 
 
@@ -47,8 +50,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="Tune recurrent depth on validation, then evaluate the winner on test once.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", type=Path, default=Path("configs/mnist/pilot.toml"))
-    parser.add_argument("--output-root", type=Path, default=Path("runs/round1"))
+    parser.add_argument("--preset", choices=MNIST_PRESET_NAMES, default="pilot")
+    parser.add_argument(
+        "--experts-per-family",
+        type=positive_int,
+        help="Override the selected preset's balanced expert-family count.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        help="Candidate root; derived from the preset name when omitted.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--patience", type=int, default=5)
@@ -58,16 +70,37 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    base_experiment = load_experiment_config(args.config)
-    output_root = ensure_directory(args.output_root)
+    base_experiment = get_mnist_preset(
+        args.preset,
+        experts_per_family=args.experts_per_family,
+    )
+    default_output_root = (
+        Path("runs/round1")
+        if base_experiment.experiment_name == "pilot"
+        else Path("runs") / f"{base_experiment.experiment_name}_round1"
+    )
+    output_root = ensure_directory(args.output_root or default_output_root)
     device = select_device(args.device)
     candidate_results: list[dict[str, object]] = []
 
     for candidate in ROUND_ONE_CANDIDATES:
         experiment = _candidate_experiment(base_experiment, candidate, args.epochs, args.patience)
         candidate_path = ensure_directory(output_root / candidate.name / f"seed_{experiment.training.seed}")
+        validation_manifest_path = candidate_path / "validation_manifest.json"
+        require_manifest_for_resume(candidate_path, "validation_manifest.json")
+        if validation_manifest_path.is_file():
+            previous_manifest = load_json(validation_manifest_path)
+            previous_experiment = experiment_from_dict(previous_manifest.get("config"))
+            if previous_experiment != experiment:
+                raise ValueError(
+                    f"Existing candidate {candidate.name!r} has a different resolved configuration"
+                )
         result_path = candidate_path / "validation_result.json"
         if result_path.is_file():
+            if not validation_manifest_path.is_file():
+                raise FileNotFoundError(
+                    f"Cannot validate completed candidate without {validation_manifest_path}"
+                )
             print(f"Using completed validation candidate: {candidate.name}")
             candidate_results.append(load_json(result_path))
             continue
@@ -87,7 +120,7 @@ def main(argv: list[str] | None = None) -> None:
         manifest["round_one_candidate"] = asdict(candidate)
         manifest["test_set_accessed"] = False
         manifest["total_parameters"] = count_parameters(model)
-        save_json(candidate_path / "validation_manifest.json", manifest)
+        save_json(validation_manifest_path, manifest)
 
         training_result = train_model(model, experiment, loaders, device, candidate_path)
         validation_path = ensure_directory(candidate_path / "validation")
@@ -123,12 +156,26 @@ def main(argv: list[str] | None = None) -> None:
     )
     selection_path = output_root / "selection.json"
     selected_test_path = ensure_directory(output_root / "selected_test")
-    if (selected_test_path / "run_complete.json").is_file():
-        previous_selection = load_json(selection_path)
-        if previous_selection.get("selected_candidate") != selected_candidate.name:
-            raise RuntimeError("The validation winner changed after the sealed test was evaluated")
+    if _sealed_test_already_finished(
+        selection_path,
+        selected_test_path / "run_complete.json",
+        selected_candidate.name,
+    ):
         print("Sealed test evaluation already exists; leaving it unchanged")
         return
+
+    selection = {
+        "selection_rule": (
+            "highest validation accuracy; within 0.10 percentage points prefer lower validation NLL, "
+            "forced-exit rate, mean depth, then training time"
+        ),
+        "selected_candidate": selected_candidate.name,
+        "selected_validation_accuracy": selected_result["validation_accuracy"],
+        "status": "test_started",
+        "test_set_accessed": True,
+        "candidates": candidate_results,
+    }
+    save_json(selection_path, selection)
 
     selected_experiment = _candidate_experiment(
         base_experiment,
@@ -158,16 +205,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     save_json(selected_test_path / "evaluation_summary.json", test_summary)
     _write_selected_figures(selected_test_path, model.expert_names)
-    selection = {
-        "selection_rule": (
-            "highest validation accuracy; within 0.10 percentage points prefer lower validation NLL, "
-            "forced-exit rate, mean depth, then training time"
-        ),
-        "selected_candidate": selected_candidate.name,
-        "selected_validation_accuracy": selected_result["validation_accuracy"],
-        "sealed_test_accuracy": test_summary["accuracy"],
-        "candidates": candidate_results,
-    }
+    selection["status"] = "complete"
+    selection["sealed_test_accuracy"] = test_summary["accuracy"]
     save_json(selection_path, selection)
     save_json(
         selected_test_path / "run_complete.json",
@@ -178,6 +217,30 @@ def main(argv: list[str] | None = None) -> None:
         },
     )
     print(f"Sealed test accuracy: {float(test_summary['accuracy']):.4f}")
+
+
+def _sealed_test_already_finished(
+    selection_path: Path,
+    completion_path: Path,
+    selected_candidate: str,
+) -> bool:
+    if completion_path.is_file():
+        previous_selection = load_json(selection_path)
+        if previous_selection.get("selected_candidate") != selected_candidate:
+            raise RuntimeError("The validation winner changed after the sealed test was evaluated")
+        return True
+    if not selection_path.is_file():
+        return False
+
+    previous_selection = load_json(selection_path)
+    if previous_selection.get("selected_candidate") != selected_candidate:
+        raise RuntimeError("The validation winner changed after the sealed test was selected")
+    if previous_selection.get("status") == "complete":
+        raise RuntimeError("Sealed test completed without a completion marker; inspect the saved artifacts")
+    raise RuntimeError(
+        "Sealed test access was already started. Refusing to evaluate the official test set again; "
+        "inspect the saved artifacts and regenerate figures offline."
+    )
 
 
 def _candidate_experiment(

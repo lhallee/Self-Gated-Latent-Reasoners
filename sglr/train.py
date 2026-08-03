@@ -20,6 +20,7 @@ from sglr.artifacts import (
     build_run_manifest,
     ensure_directory,
     load_checkpoint,
+    require_manifest_for_resume,
     run_directory,
     save_checkpoint,
     save_json,
@@ -344,6 +345,7 @@ def run_experiment(
         )
     )
     manifest_path = run_path / "manifest.json"
+    require_manifest_for_resume(run_path)
     if manifest_path.is_file():
         validate_run_config(run_path, experiment)
     loaders = build_mnist_loaders(experiment.training, download=download)
@@ -351,9 +353,12 @@ def run_experiment(
 
     total_parameters = count_parameters(model)
     trainable_parameters = count_parameters(model, trainable_only=True)
-    if variant != "fixed_depth" and total_parameters >= 200_000:
-        raise ValueError(f"Primary SGLR model exceeds the 200,000 parameter budget: {total_parameters:,}")
-    if variant != "fixed_depth":
+    parameter_budget = experiment.model.parameter_budget
+    if variant != "fixed_depth" and parameter_budget is not None and total_parameters >= parameter_budget:
+        raise ValueError(
+            f"SGLR model exceeds its {parameter_budget:,} parameter budget: {total_parameters:,}"
+        )
+    if variant != "fixed_depth" and experiment.model.require_router_smaller_than_experts:
         router_parameters = count_parameters(model.core.routers)
         expert_parameters = count_parameters(model.core.experts)
         if router_parameters > expert_parameters:

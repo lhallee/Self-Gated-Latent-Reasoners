@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from sglr.config import ExperimentConfig
+from sglr.config import ExperimentConfig, experiment_from_dict
 
 
 COMPLETION_FILENAME = "run_complete.json"
@@ -30,6 +30,16 @@ def ensure_directory(path: str | Path) -> Path:
     directory = Path(path)
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def require_manifest_for_resume(path: str | Path, manifest_name: str = "manifest.json") -> None:
+    """Refuse to reuse a nonempty run directory whose configuration cannot be verified."""
+
+    directory = Path(path)
+    if any(directory.iterdir()) and not (directory / manifest_name).is_file():
+        raise FileNotFoundError(
+            f"Refusing to resume nonempty run directory without {manifest_name}: {directory}"
+        )
 
 
 def run_is_complete(path: str | Path) -> bool:
@@ -64,7 +74,12 @@ def validate_run_config(path: str | Path, experiment: ExperimentConfig) -> None:
 
     manifest = load_json(Path(path) / "manifest.json")
     expected = json.loads(json.dumps(asdict(experiment)))
-    if manifest.get("config") != expected:
+    existing_payload = manifest.get("config")
+    try:
+        existing = json.loads(json.dumps(asdict(experiment_from_dict(existing_payload))))
+    except (TypeError, ValueError):
+        existing = existing_payload
+    if existing != expected:
         raise ValueError(
             f"Existing run has a different configuration: {path}. "
             "Choose a new experiment_name or output_root."

@@ -13,10 +13,9 @@ from sglr.artifacts import (
     load_json,
     run_is_complete,
     save_json,
-    validate_run_config,
 )
 from sglr.analysis import SweepRun, build_sweep_run, load_evaluation_records, load_json_object
-from sglr.config import load_experiment_config, with_run_overrides
+from sglr.config import experiment_from_dict
 from sglr.data import build_mnist_loaders
 from sglr.evaluation import evaluate_model
 from sglr.figures import generate_run_figures, generate_sweep_figure, load_image_archive
@@ -72,9 +71,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-evaluate a frozen checkpoint, then regenerate its run figures.",
     )
     checkpoint_parser.add_argument("--run-dir", type=Path, required=True, help="Run containing best_model.pt.")
-    checkpoint_parser.add_argument("--config", type=Path, required=True, help="TOML used to build the checkpoint.")
-    checkpoint_parser.add_argument("--variant", help="Routing variant; defaults to the TOML value.")
-    checkpoint_parser.add_argument("--seed", type=int, help="Evaluation seed; defaults to the TOML value.")
     checkpoint_parser.add_argument("--device", default="auto", help="Torch device used for evaluation.")
     checkpoint_parser.add_argument("--download", action="store_true", help="Allow missing MNIST files to download.")
     checkpoint_parser.add_argument("--permutations", type=_positive_int, default=1000, help="MI null permutations.")
@@ -158,12 +154,9 @@ def analyze_checkpoint(args: argparse.Namespace) -> list[Path]:
     manifest_seed = manifest.get("seed")
     if not isinstance(manifest_variant, str) or not isinstance(manifest_seed, int):
         raise ValueError("Run manifest must record a string variant and integer seed")
-    experiment = with_run_overrides(
-        load_experiment_config(args.config),
-        routing_mode=args.variant or manifest_variant,
-        seed=args.seed if args.seed is not None else manifest_seed,
-    )
-    validate_run_config(run_directory, experiment)
+    experiment = experiment_from_dict(manifest.get("config"))
+    if experiment.model.routing_mode != manifest_variant or experiment.training.seed != manifest_seed:
+        raise ValueError("Run manifest variant or seed disagrees with its resolved configuration")
     seed_everything(experiment.training.seed)
     device = select_device(args.device)
     loaders = build_mnist_loaders(experiment.training, download=args.download)

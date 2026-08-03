@@ -6,7 +6,7 @@ from sglr.config import (
     ModelConfig,
     SweepConfig,
     TrainingConfig,
-    load_experiment_config,
+    experiment_from_dict,
 )
 from sglr.model import (
     MNISTSGLR,
@@ -15,6 +15,7 @@ from sglr.model import (
     SGLRCoreOutput,
     build_mnist_model,
 )
+from sglr.presets.mnist import MNIST_PRESET_NAMES, get_mnist_preset, make_expert_pool
 from sglr.router import RoutingTrace
 
 
@@ -23,6 +24,7 @@ __all__ = [
     "ExpertSpec",
     "MNISTSGLR",
     "MNISTOutput",
+    "MNIST_PRESET_NAMES",
     "ModelConfig",
     "RoutingTrace",
     "SGLRCore",
@@ -30,5 +32,7 @@ __all__ = [
     "SweepConfig",
     "TrainingConfig",
     "build_mnist_model",
-    "load_experiment_config",
+    "experiment_from_dict",
+    "get_mnist_preset",
+    "make_expert_pool",
 ]

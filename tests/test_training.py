@@ -2,11 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from sglr.analysis import load_evaluation_records
-from sglr.artifacts import run_is_complete, save_checkpoint, save_json, save_jsonl
+from sglr.artifacts import (
+    require_manifest_for_resume,
+    run_is_complete,
+    save_checkpoint,
+    save_json,
+    save_jsonl,
+)
 from sglr.config import ExpertSpec, ModelConfig
 from sglr.evaluation import evaluate_model
 from sglr.model import MNISTSGLR
@@ -109,3 +116,10 @@ def test_completion_marker_is_required(tmp_path: Path) -> None:
         },
     )
     assert run_is_complete(tmp_path)
+
+
+def test_resume_requires_manifest_in_nonempty_run_directory(tmp_path: Path) -> None:
+    save_checkpoint(tmp_path / "last_state.pt", {"model_state": {}})
+
+    with pytest.raises(FileNotFoundError, match="Refusing to resume"):
+        require_manifest_for_resume(tmp_path)

@@ -39,7 +39,11 @@ The expert families impose different, simple priors:
 - **Attention experts** mix information across the 49-token sequence and honor the attention mask.
 - **Convolution experts** view `(l, d)` as a two-dimensional activation map and use small odd, same-padded kernels. Token-only, feature-only, joint, and dilated kernels provide distinct local biases.
 
-The primary preset contains eight experts from each family. Their exact widths, kernels, channels, heads, and dilation values are listed in the TOML files under `configs/mnist/`. The gated model must remain below 200,000 total parameters, and its complete router pool must not contain more parameters than its complete expert pool. Both invariants are checked before training.
+The primary preset contains eight experts from each family. Their widths, kernels,
+channels, heads, and dilation values are generated in `sglr/presets/mnist.py`.
+The gated model must remain below 200,000 total parameters, and its complete
+router pool must not contain more parameters than its complete expert pool. Both
+invariants are checked for the canonical 24-expert pool.
 
 ## Discrete routing and credit assignment
 
@@ -66,12 +70,16 @@ The focused sweep runs three seeds (`7`, `17`, and `27`) for four variants:
 
 The fixed-depth baseline adjusts its final MLP width to the smallest multiple of eight that places its trainable parameter count within 2% of the gated model. This control is important: accuracy differences are not interpretable if one model simply receives a substantially larger parameter budget.
 
-The supplied configurations are:
+The supplied Python presets are:
 
-- `configs/mnist/smoke.toml`: 256 training examples, 128 validation examples, and one epoch. It is intended only for a cached-data pipeline check.
-- `configs/mnist/pilot.toml`: a seeded stratified 12,000/2,000 train/validation subset and five epochs.
-- `configs/mnist/full.toml`: a fixed 50,000/10,000 split of the official MNIST training set.
-- `configs/mnist/focused.toml`: the four-variant, three-seed pilot sweep used for the primary comparison.
+- `smoke`: 256 training examples, 128 validation examples, and one epoch.
+- `pilot`: a seeded stratified 12,000/2,000 train/validation subset and five epochs.
+- `full`: a fixed 50,000/10,000 split of the official MNIST training set.
+- `focused`: the four-variant, three-seed pilot sweep used for the primary comparison.
+
+These are ordinary Python functions in `sglr/presets/mnist.py`. To expand the
+pool uniformly, pass `--experts-per-family 32`, or call `make_expert_pool()` with
+separate MLP, attention, and convolution counts from Python.
 
 The official test split is not used for checkpoint selection. It is evaluated once after training completes. Subset selection is seeded, stratified, and disjoint.
 
@@ -80,29 +88,24 @@ The official test split is not used for checkpoint selection. It is evaluated on
 Python 3.11 or newer is required.
 
 ```bash
-python -m pip install -e .
+python -m pip install -r requirements.txt
 ```
 
-For development checks:
-
-```bash
-python -m pip install -e ".[dev]"
-```
-
-The core environment contains PyTorch, torchvision, NumPy, and Matplotlib. Historical Streamlit, graph, and probe workflows are not core dependencies.
+The environment contains PyTorch, torchvision, NumPy, Matplotlib, pytest, Ruff,
+and mypy. Historical Streamlit, graph, and probe workflows are not dependencies.
 
 ## Commands
 
 Train one variant:
 
 ```bash
-python -m scripts.train_mnist --config configs/mnist/pilot.toml --variant straight_through --seed 7
+python -m scripts.train_mnist --preset pilot --variant straight_through --seed 7
 ```
 
 Run or resume the focused sweep:
 
 ```bash
-python -m scripts.run_mnist_sweep --config configs/mnist/focused.toml
+python -m scripts.run_mnist_sweep --preset focused
 ```
 
 Rebuild one run's figures from frozen evaluation artifacts without training:
@@ -114,7 +117,7 @@ python -m scripts.analyze_mnist run --run-dir runs/<completed_run>
 Recompute the evaluation artifacts and figures from a frozen checkpoint:
 
 ```bash
-python -m scripts.analyze_mnist checkpoint --run-dir runs/<completed_run> --config configs/mnist/pilot.toml
+python -m scripts.analyze_mnist checkpoint --run-dir runs/<completed_run>
 ```
 
 Aggregate the completed focused sweep:
@@ -123,7 +126,12 @@ Aggregate the completed focused sweep:
 python -m scripts.analyze_mnist sweep --sweep-root runs/focused --output-dir figures/generated/focused
 ```
 
-Equivalent installed commands are `sglr-train`, `sglr-sweep`, and `sglr-figures`. CLI flags use kebab-case; TOML files are the single source for experiment defaults.
+CLI flags use kebab-case; typed Python preset functions are the single source for experiment defaults.
+Use `--experts-per-family 16` for 48 experts or edit
+`sglr/presets/mnist.py` to give the MLP, attention, and convolution families
+different counts. The canonical 24-expert order remains stable so old
+checkpoints and recorded route IDs retain their meaning. Expanded presets get a
+distinct run name automatically, such as `pilot_48_experts`.
 
 For validation-only depth tuning, safe resume behavior, and a field-by-field
 hyperparameter guide, see [`docs/running_experiments.md`](docs/running_experiments.md).

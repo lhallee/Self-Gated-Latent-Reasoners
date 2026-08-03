@@ -10,7 +10,7 @@ candidate resumes from its last complete epoch:
 
 ```bash
 python -m scripts.run_round1 \
-  --config configs/mnist/pilot.toml \
+  --preset pilot \
   --output-root runs/round1 \
   --device cuda \
   --epochs 20 \
@@ -21,6 +21,11 @@ Candidate selection uses only the 2,000-example validation subset. The script
 evaluates the official test set once, after all candidates finish and the winner
 is frozen. If `runs/round1/selected_test/run_complete.json` exists, rerunning the
 command does not evaluate test again.
+
+The script records `status: test_started` before loading the sealed test split.
+If evaluation is interrupted after that point, it fails closed on the next run
+instead of silently testing twice. Inspect the saved artifacts and use the
+offline analysis command to regenerate any missing figures.
 
 Use a new `--output-root` whenever you change the candidate grid or selection
 protocol. This prevents an old sealed-test result from being associated with a
@@ -58,19 +63,54 @@ and validation-accuracy early stopping. `--device` accepts `auto`, `cpu`, or
 
 ## Change the model and data preset
 
-The TOML files under `configs/mnist/` are the source of the common model,
-expert-pool, optimizer, and data settings:
+The functions in `sglr/presets/mnist.py` are the source of the common model,
+expert-pool, optimizer, and data settings. Available preset names are `smoke`,
+`pilot`, `full`, and `focused`.
 
-- `smoke.toml`: 256 train, 128 validation, one epoch.
-- `pilot.toml`: 12,000 train and 2,000 validation.
-- `full.toml`: 50,000 train and 10,000 validation.
-- `focused.toml`: the four-variant, three-seed comparison.
+Use `make_expert_pool()` to construct a heterogeneous pool without listing every
+expert:
 
-Edit `[training]` to change batch size, weight decay, warmup fraction, split
-sizes, seed, worker count, or logging frequency. Edit `[model]` to change latent
-width, patch size, router width, or the default routing mode. Every
-`[[model.experts]]` table defines one named expert and its family-specific
-width, heads, channels, kernel, or dilation.
+```python
+from sglr.presets.mnist import make_expert_pool
+
+experts = make_expert_pool(
+    mlp_experts=32,
+    attention_experts=32,
+    conv_experts=32,
+)
+```
+
+The builders cycle the canonical hyperparameter templates and generate stable,
+unique names. The CLI shorthand `--experts-per-family 32` creates the same
+balanced 96-expert pool. Noncanonical pools disable the 200,000-parameter
+research guard because the purpose is explicitly to scale expert count.
+They also receive a distinct name such as `pilot_96_experts`, preventing their
+checkpoints from colliding with the canonical `pilot` run.
+The router count and each router's output width both grow with the number of
+experts, so router parameters grow quadratically even though each expert stays
+small. The 24-, 48-, and 96-expert pilot models currently contain 103,933,
+222,799, and 519,283 parameters, respectively.
+
+Use `dataclasses.replace()` inside a preset function to change batch size,
+weight decay, warmup fraction, split sizes, seed, workers, latent width, patch
+size, router width, or routing mode. For a reusable custom preset, add a function
+beside `pilot()` and register it in `MNIST_PRESETS`:
+
+```python
+def large_pilot(*, experts_per_family: int = 32) -> ExperimentConfig:
+    experiment = pilot(experts_per_family=experts_per_family)
+    return replace(
+        experiment,
+        experiment_name="large_pilot",
+        model=replace(experiment.model, max_steps=12),
+        training=replace(experiment.training, learning_rate=1e-3, epochs=20),
+    )
+```
+
+Then add `"large_pilot": large_pilot` to `MNIST_PRESETS` and select it with
+`--preset large_pilot`. Calling `experiment.validate()` in a unit test catches
+invalid shapes, duplicate expert names, routing limits, and training ranges
+before a long run begins.
 
 Use a distinct `experiment_name` or output root after changing a configuration.
 The runners reject reuse of a completed run directory with a different resolved
@@ -82,7 +122,7 @@ After hyperparameters are frozen, train or resume one ordinary run with:
 
 ```bash
 python -m scripts.train_mnist \
-  --config configs/mnist/pilot.toml \
+  --preset pilot \
   --variant straight_through \
   --seed 7 \
   --device cuda

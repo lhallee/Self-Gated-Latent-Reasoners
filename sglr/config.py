@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import tomllib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Mapping
 
 
 SCHEMA_VERSION = 2
@@ -26,15 +25,6 @@ class ExpertSpec:
     kernel_size: tuple[int, int] = (1, 1)
     dilation: tuple[int, int] = (1, 1)
     dropout: float = 0.0
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "ExpertSpec":
-        values = dict(payload)
-        if "kernel_size" in values:
-            values["kernel_size"] = tuple(int(value) for value in values["kernel_size"])
-        if "dilation" in values:
-            values["dilation"] = tuple(int(value) for value in values["dilation"])
-        return cls(**values)
 
     def validate(self) -> None:
         if not self.name:
@@ -74,13 +64,8 @@ class ModelConfig:
     router_dropout: float = 0.0
     routing_mode: str = "straight_through"
     experts: tuple[ExpertSpec, ...] = field(default_factory=tuple)
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "ModelConfig":
-        values = dict(payload)
-        raw_experts = values.pop("experts", [])
-        experts = tuple(ExpertSpec.from_dict(expert) for expert in raw_experts)
-        return cls(experts=experts, **values)
+    parameter_budget: int | None = 200_000
+    require_router_smaller_than_experts: bool = True
 
     @property
     def num_experts(self) -> int:
@@ -114,6 +99,8 @@ class ModelConfig:
             raise ValueError("router_dropout must be in [0, 1)")
         if self.routing_mode not in ROUTING_MODES:
             raise ValueError(f"Unsupported routing_mode: {self.routing_mode}")
+        if self.parameter_budget is not None and self.parameter_budget <= 0:
+            raise ValueError("parameter_budget must be positive or None")
         if not self.experts:
             raise ValueError("At least one expert is required")
 
@@ -178,15 +165,6 @@ class SweepConfig:
     )
     seeds: tuple[int, ...] = (7, 17, 27)
 
-    @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "SweepConfig":
-        values = dict(payload)
-        if "variants" in values:
-            values["variants"] = tuple(str(value) for value in values["variants"])
-        if "seeds" in values:
-            values["seeds"] = tuple(int(value) for value in values["seeds"])
-        return cls(**values)
-
     def validate(self) -> None:
         if not self.variants or not self.seeds:
             raise ValueError("Sweep variants and seeds cannot be empty")
@@ -221,23 +199,35 @@ class ExperimentConfig:
         return asdict(self)
 
 
-def load_experiment_config(path: str | Path) -> ExperimentConfig:
-    config_path = Path(path)
-    with config_path.open("rb") as config_file:
-        payload = tomllib.load(config_file)
+def experiment_from_dict(payload: object) -> ExperimentConfig:
+    """Rehydrate a resolved manifest configuration without consulting a preset."""
 
+    resolved_payload = _mapping(payload, "experiment")
     allowed_keys = {"schema_version", "experiment_name", "model", "training", "sweep"}
-    unknown_keys = set(payload) - allowed_keys
+    unknown_keys = set(resolved_payload) - allowed_keys
     if unknown_keys:
-        raise ValueError(f"Unknown top-level configuration keys: {sorted(unknown_keys)}")
+        raise ValueError(f"Unknown experiment configuration keys: {sorted(unknown_keys)}")
 
-    model = ModelConfig.from_dict(payload["model"])
-    training = TrainingConfig(**payload["training"])
-    raw_sweep = payload.get("sweep")
-    sweep = None if raw_sweep is None else SweepConfig.from_dict(raw_sweep)
+    model_payload = dict(_mapping(resolved_payload.get("model"), "model"))
+    raw_experts = model_payload.pop("experts", None)
+    if not isinstance(raw_experts, (list, tuple)):
+        raise ValueError("Resolved model configuration must contain an expert list")
+    experts = tuple(_expert_from_dict(_mapping(value, "expert")) for value in raw_experts)
+    model = ModelConfig(experts=experts, **model_payload)
+
+    training = TrainingConfig(**dict(_mapping(resolved_payload.get("training"), "training")))
+    raw_sweep = resolved_payload.get("sweep")
+    sweep = None
+    if raw_sweep is not None:
+        sweep_payload = dict(_mapping(raw_sweep, "sweep"))
+        sweep = SweepConfig(
+            variants=tuple(str(value) for value in sweep_payload.get("variants", ())),
+            seeds=tuple(int(value) for value in sweep_payload.get("seeds", ())),
+        )
+
     experiment = ExperimentConfig(
-        schema_version=int(payload.get("schema_version", 0)),
-        experiment_name=str(payload.get("experiment_name", "")),
+        schema_version=int(resolved_payload.get("schema_version", 0)),
+        experiment_name=str(resolved_payload.get("experiment_name", "")),
         model=model,
         training=training,
         sweep=sweep,
@@ -246,26 +236,34 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     return experiment
 
 
+def _expert_from_dict(payload: Mapping[str, Any]) -> ExpertSpec:
+    values = dict(payload)
+    values["kernel_size"] = tuple(int(value) for value in values.get("kernel_size", (1, 1)))
+    values["dilation"] = tuple(int(value) for value in values.get("dilation", (1, 1)))
+    return ExpertSpec(**values)
+
+
+def _mapping(value: object, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Resolved {name} configuration must be a mapping")
+    return value
+
+
 def with_run_overrides(
     experiment: ExperimentConfig,
     routing_mode: str | None = None,
     seed: int | None = None,
 ) -> ExperimentConfig:
-    model_values = asdict(experiment.model)
-    model_values["experts"] = [asdict(expert) for expert in experiment.model.experts]
-    if routing_mode is not None:
-        model_values["routing_mode"] = routing_mode
-
-    training_values = asdict(experiment.training)
-    if seed is not None:
-        training_values["seed"] = seed
-
-    overridden = ExperimentConfig(
-        schema_version=experiment.schema_version,
-        experiment_name=experiment.experiment_name,
-        model=ModelConfig.from_dict(model_values),
-        training=TrainingConfig(**training_values),
-        sweep=experiment.sweep,
+    overridden = replace(
+        experiment,
+        model=replace(
+            experiment.model,
+            routing_mode=experiment.model.routing_mode if routing_mode is None else routing_mode,
+        ),
+        training=replace(
+            experiment.training,
+            seed=experiment.training.seed if seed is None else seed,
+        ),
     )
     overridden.validate()
     return overridden

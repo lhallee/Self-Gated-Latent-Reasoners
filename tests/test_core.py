@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import replace
 
 import pytest
 import torch
 import torch.nn as nn
 
-from sglr.config import ExpertSpec, ModelConfig, load_experiment_config
+from sglr.config import ExpertSpec, ModelConfig
 from sglr.experts import ExpertDelta, build_expert
 from sglr.model import MNISTSGLR, SGLRCore, build_mnist_model, count_parameters
+from sglr.presets.mnist import get_mnist_preset
 from sglr.router import RouterHead, masked_mean
 
 
@@ -199,15 +200,13 @@ def test_straight_through_and_sparse_forward_states_match() -> None:
 
 
 def test_primary_and_fixed_depth_parameter_budgets() -> None:
-    primary_config = load_experiment_config("configs/mnist/pilot.toml").model
+    primary_config = get_mnist_preset("pilot").model
     primary_model = MNISTSGLR(primary_config)
     primary_count = count_parameters(primary_model, trainable_only=True)
     router_count = count_parameters(primary_model.core.routers, trainable_only=True)
     expert_count = count_parameters(primary_model.core.experts, trainable_only=True)
 
-    fixed_values = asdict(primary_config)
-    fixed_values["routing_mode"] = "fixed_depth"
-    fixed_model = build_mnist_model(ModelConfig.from_dict(fixed_values))
+    fixed_model = build_mnist_model(replace(primary_config, routing_mode="fixed_depth"))
     fixed_count = count_parameters(fixed_model, trainable_only=True)
 
     assert primary_count < 200_000

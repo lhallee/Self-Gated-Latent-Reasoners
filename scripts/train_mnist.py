@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import replace
-from pathlib import Path
 
+from scripts.arguments import positive_int
 from sglr.artifacts import run_directory, run_is_complete, validate_run_config
-from sglr.config import ROUTING_MODES, load_experiment_config, with_run_overrides
+from sglr.config import ROUTING_MODES, with_run_overrides
+from sglr.presets.mnist import MNIST_PRESET_NAMES, get_mnist_preset
 from sglr.train import run_experiment
 
 
@@ -17,7 +18,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Train one schema-versioned SGLR MNIST experiment.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", type=Path, required=True, help="TOML experiment configuration.")
+    parser.add_argument("--preset", choices=MNIST_PRESET_NAMES, required=True)
+    parser.add_argument(
+        "--experts-per-family",
+        type=positive_int,
+        help="Override the selected preset's balanced expert-family count.",
+    )
     parser.add_argument("--variant", choices=sorted(ROUTING_MODES), help="Override model.routing_mode.")
     parser.add_argument("--seed", type=int, help="Override the configured random seed.")
     parser.add_argument("--device", help="Override the configured Torch device.")
@@ -28,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     experiment = with_run_overrides(
-        load_experiment_config(args.config),
+        get_mnist_preset(args.preset, experts_per_family=args.experts_per_family),
         routing_mode=args.variant,
         seed=args.seed,
     )
