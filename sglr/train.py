@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from sglr.artifacts import (
     build_run_manifest,
@@ -113,6 +114,8 @@ def run_epoch(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     grad_accum_steps: int = 1,
     log_interval: int = 0,
+    description: str = "Epoch",
+    show_progress: bool = False,
 ) -> EpochMetrics:
     training = optimizer is not None
     model.train(training)
@@ -120,15 +123,19 @@ def run_epoch(
         optimizer.zero_grad(set_to_none=True)
 
     total_examples = 0
-    total_correct = 0
-    total_loss = 0.0
-    total_cross_entropy = 0.0
-    total_load_balance = 0.0
-    total_compute_penalty = 0.0
-    total_route_depth = 0.0
+    metric_totals = torch.zeros(6, device=device, dtype=torch.float32)  # (6,)
     total_batches = len(data_loader)
 
-    for batch_index, (images, labels, _) in enumerate(data_loader):
+    batches = tqdm(
+        data_loader,
+        desc=description,
+        total=total_batches,
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+    for batch_index, (images, labels, _) in enumerate(batches):
         # images: (b, 1, 28, 28); labels: (b,)
         images = images.to(device, non_blocking=True)  # (b, 1, 28, 28)
         labels = labels.to(device, non_blocking=True)  # (b,)
@@ -159,29 +166,55 @@ def run_epoch(
         b = labels.size(0)
         predictions = output.logits.argmax(dim=-1)  # (b,)
         total_examples += b
-        total_correct += int(predictions.eq(labels).sum().item())
-        total_loss += float(loss.detach().item()) * b
-        total_cross_entropy += float(cross_entropy.detach().item()) * b
-        total_load_balance += float(balance_loss.detach().item()) * b
-        total_compute_penalty += float(depth_loss.detach().item()) * b
-        total_route_depth += float(output.trace.route_depth.float().sum().item())
+        batch_metric_totals = torch.stack(
+            (
+                loss.detach() * b,
+                cross_entropy.detach() * b,
+                balance_loss.detach() * b,
+                depth_loss.detach() * b,
+                predictions.eq(labels).sum(),
+                output.trace.route_depth.sum(),
+            )
+        )  # (6,)
+        metric_totals += batch_metric_totals  # (6,)
 
-        if log_interval and ((batch_index + 1) % log_interval == 0 or batch_index + 1 == total_batches):
-            accuracy = total_correct / total_examples
+        should_report = (
+            batch_index == 0
+            or batch_index + 1 == total_batches
+            or (log_interval > 0 and (batch_index + 1) % log_interval == 0)
+        )
+        if show_progress and should_report:
+            current_metrics = _epoch_metrics(metric_totals, total_examples)
+            postfix: dict[str, str] = {
+                "loss": f"{current_metrics.loss:.4f}",
+                "acc": f"{current_metrics.accuracy:.3f}",
+                "depth": f"{current_metrics.mean_route_depth:.2f}",
+            }
+            if training:
+                postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
+            batches.set_postfix(postfix, refresh=True)
+        elif log_interval and should_report:
+            current_metrics = _epoch_metrics(metric_totals, total_examples)
             print(
                 f"  batch {batch_index + 1}/{total_batches} "
-                f"loss={total_loss / total_examples:.4f} accuracy={accuracy:.3f}"
+                f"loss={current_metrics.loss:.4f} accuracy={current_metrics.accuracy:.3f}"
             )
 
     if total_examples == 0:
         raise ValueError("Data loader produced no examples")
+    return _epoch_metrics(metric_totals, total_examples)
+
+
+def _epoch_metrics(metric_totals: Tensor, total_examples: int) -> EpochMetrics:
+    # metric_totals: (6,)
+    loss, cross_entropy, load_balance, compute_penalty, correct, route_depth = metric_totals.tolist()
     return EpochMetrics(
-        loss=total_loss / total_examples,
-        cross_entropy=total_cross_entropy / total_examples,
-        load_balance=total_load_balance / total_examples,
-        compute_penalty=total_compute_penalty / total_examples,
-        accuracy=total_correct / total_examples,
-        mean_route_depth=total_route_depth / total_examples,
+        loss=loss / total_examples,
+        cross_entropy=cross_entropy / total_examples,
+        load_balance=load_balance / total_examples,
+        compute_penalty=compute_penalty / total_examples,
+        accuracy=correct / total_examples,
+        mean_route_depth=route_depth / total_examples,
     )
 
 
@@ -191,8 +224,10 @@ def train_model(
     loaders: MNISTDataLoaders,
     device: torch.device,
     run_path: Path,
+    show_progress: bool = False,
 ) -> TrainingResult:
     config = experiment.training
+    report = tqdm.write if show_progress else print
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(
         trainable_parameters,
@@ -228,15 +263,32 @@ def train_model(
         previous_elapsed_seconds = float(state.get("elapsed_seconds", 0.0))
         previous_peak_memory = int(state.get("training_peak_cuda_memory_bytes", 0))
         _restore_rng_state(state["rng_state"], loaders.train_generator)
-        print(f"Resuming {run_path} at epoch {start_epoch}")
+        message = (
+            f"Resuming at epoch {start_epoch}/{config.epochs}; "
+            f"best validation accuracy={best_validation_accuracy:.3f} at epoch {best_epoch}"
+        )
+        report(message)
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     training_start = time.perf_counter()
-    for epoch in range(start_epoch, config.epochs + 1):
+    epochs = tqdm(
+        range(start_epoch, config.epochs + 1),
+        desc="Training epochs",
+        total=config.epochs,
+        initial=start_epoch - 1,
+        unit="epoch",
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+    for epoch in epochs:
         if patience_counter >= config.patience:
+            message = (
+                f"Early stopping before epoch {epoch}: no validation improvement for "
+                f"{patience_counter} epoch(s)"
+            )
+            report(message)
             break
-        print(f"Epoch {epoch}/{config.epochs}")
         train_metrics = run_epoch(
             model=model,
             data_loader=loaders.train,
@@ -248,6 +300,8 @@ def train_model(
             scheduler=scheduler,
             grad_accum_steps=config.grad_accum_steps,
             log_interval=config.log_interval,
+            description=f"Train {epoch}/{config.epochs}",
+            show_progress=show_progress,
         )
         validation_metrics = run_epoch(
             model=model,
@@ -256,6 +310,8 @@ def train_model(
             variant=experiment.model.routing_mode,
             load_balance_coefficient=config.load_balance_coefficient,
             compute_penalty_coefficient=config.compute_penalty_coefficient,
+            description=f"Validate {epoch}/{config.epochs}",
+            show_progress=show_progress,
         )
         history.append(
             {
@@ -266,12 +322,7 @@ def train_model(
             }
         )
         save_json(run_path / "training_history.json", {"epochs": history})
-        print(
-            f"  train accuracy={train_metrics.accuracy:.3f} "
-            f"validation accuracy={validation_metrics.accuracy:.3f} "
-            f"depth={validation_metrics.mean_route_depth:.2f}"
-        )
-
+        improved = validation_metrics.accuracy > best_validation_accuracy
         if validation_metrics.accuracy > best_validation_accuracy:
             best_validation_accuracy = validation_metrics.accuracy
             best_epoch = epoch
@@ -286,6 +337,26 @@ def train_model(
             )
         else:
             patience_counter += 1
+
+        epochs.set_postfix(
+            {
+                "train_acc": f"{train_metrics.accuracy:.3f}",
+                "val_acc": f"{validation_metrics.accuracy:.3f}",
+                "best": f"{best_validation_accuracy:.3f}",
+                "patience": f"{patience_counter}/{config.patience}",
+            },
+            refresh=False,
+        )
+        epoch_message = (
+            f"Epoch {epoch}/{config.epochs}: train loss={train_metrics.loss:.4f}, "
+            f"train accuracy={train_metrics.accuracy:.3f}, "
+            f"validation loss={validation_metrics.loss:.4f}, "
+            f"validation accuracy={validation_metrics.accuracy:.3f}, "
+            f"mean depth={validation_metrics.mean_route_depth:.2f}"
+        )
+        if improved:
+            epoch_message += " [new best]"
+        report(epoch_message)
 
         save_checkpoint(
             last_state_path,
@@ -331,8 +402,10 @@ def run_experiment(
     experiment_name: str,
     download: bool = False,
     command: list[str] | None = None,
+    show_progress: bool = True,
 ) -> Path:
     experiment.validate()
+    report = tqdm.write if show_progress else print
     seed_everything(experiment.training.seed)
     device = select_device(experiment.training.device)
     variant = experiment.model.routing_mode
@@ -348,7 +421,9 @@ def run_experiment(
     require_manifest_for_resume(run_path)
     if manifest_path.is_file():
         validate_run_config(run_path, experiment)
-    loaders = build_mnist_loaders(experiment.training, download=download)
+    report(f"Preparing MNIST data for {experiment_name}...")
+    loaders = build_mnist_loaders(experiment.training, download=download, device=device)
+    report("Building model and checking parameter budgets...")
     model = build_mnist_model(experiment.model).to(device)
 
     total_parameters = count_parameters(model)
@@ -383,6 +458,9 @@ def run_experiment(
                 "train_size": len(loaders.train_indices),
                 "validation_size": len(loaders.validation_indices),
                 "test_size": len(loaders.test_indices),
+                "train_source": "official_train",
+                "validation_source": experiment.training.validation_source,
+                "test_source": "official_test",
                 "train_index_sha256": _index_digest(loaders.train_indices),
                 "validation_index_sha256": _index_digest(loaders.validation_indices),
                 "test_index_sha256": _index_digest(loaders.test_indices),
@@ -391,16 +469,36 @@ def run_experiment(
     )
     save_json(manifest_path, manifest)
 
-    print(f"Device: {device}")
-    print(f"Run: {run_path}")
-    print(f"Parameters: {total_parameters:,} total, {trainable_parameters:,} trainable")
-    training_result = train_model(model, experiment, loaders, device, run_path)
+    run_summary = (
+        f"Starting {variant} on {device}: {len(loaders.train_indices):,} train, "
+        f"{len(loaders.validation_indices):,} validation, {len(loaders.test_indices):,} test; "
+        f"{experiment.model.num_experts} experts, max depth {experiment.model.max_steps}; "
+        f"{experiment.training.epochs} epochs, batch size {experiment.training.batch_size}, "
+        f"learning rate {experiment.training.learning_rate:.1e}; "
+        f"{total_parameters:,} parameters. Artifacts: {run_path}"
+    )
+    report(run_summary)
+    training_result = train_model(
+        model,
+        experiment,
+        loaders,
+        device,
+        run_path,
+        show_progress=show_progress,
+    )
+    report(
+        f"Training finished in {training_result.elapsed_seconds / 60:.1f} min; "
+        f"best validation accuracy={training_result.best_validation_accuracy:.3f} "
+        f"at epoch {training_result.best_epoch}. Evaluating the best checkpoint..."
+    )
     evaluation_summary = evaluate_model(
         model=model,
         data_loader=loaders.test,
         device=device,
         output_directory=run_path,
         num_classes=experiment.model.num_classes,
+        description="Test evaluation",
+        show_progress=show_progress,
     )
     evaluation_summary.update(
         {
@@ -441,6 +539,13 @@ def run_experiment(
             "summary": "evaluation_summary.json",
         },
     )
+    completion_message = (
+        f"Run complete: test accuracy={float(evaluation_summary['accuracy']):.3f}, "
+        f"NLL={float(evaluation_summary['nll']):.4f}, "
+        f"mean depth={float(evaluation_summary['mean_route_depth']):.2f}, "
+        f"training time={training_result.elapsed_seconds / 60:.1f} min"
+    )
+    report(completion_message)
     return run_path
 
 

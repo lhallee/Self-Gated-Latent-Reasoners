@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 EXPERT_FAMILIES = {"mlp", "conv", "attention"}
 ROUTING_MODES = {"straight_through", "hard_argmax", "frozen_random", "fixed_depth"}
 
@@ -116,7 +116,7 @@ class TrainingConfig:
     output_root: str = "runs"
     data_root: str = "data"
     epochs: int = 5
-    batch_size: int = 128
+    batch_size: int = 256
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     warmup_fraction: float = 0.05
@@ -127,6 +127,7 @@ class TrainingConfig:
     train_size: int = 12_000
     validation_size: int = 2_000
     test_size: int = 10_000
+    validation_source: Literal["official_train", "official_test"] = "official_train"
     num_workers: int = 0
     seed: int = 7
     device: str = "auto"
@@ -147,6 +148,8 @@ class TrainingConfig:
                 raise ValueError(f"{name} must be positive")
         if self.test_size < 0 or self.num_workers < 0:
             raise ValueError("test_size and num_workers must be non-negative")
+        if self.validation_source not in {"official_train", "official_test"}:
+            raise ValueError("validation_source must be 'official_train' or 'official_test'")
         if not 0.0 <= self.warmup_fraction < 1.0:
             raise ValueError("warmup_fraction must be in [0, 1)")
         if self.weight_decay < 0.0:

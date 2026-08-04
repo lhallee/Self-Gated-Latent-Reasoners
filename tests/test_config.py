@@ -15,9 +15,19 @@ from sglr.presets.mnist import MNIST_PRESET_NAMES, get_mnist_preset, make_expert
 def test_experiment_presets_are_valid(preset_name: str) -> None:
     experiment = get_mnist_preset(preset_name)
 
-    assert experiment.schema_version == 2
+    assert experiment.schema_version == 3
     assert experiment.model.num_experts == 24
     assert experiment.model.hidden_size == 48
+
+
+def test_full_preset_uses_all_training_images_and_seals_half_the_test_split() -> None:
+    experiment = get_mnist_preset("full")
+
+    assert experiment.training.batch_size == 256
+    assert experiment.training.train_size == 60_000
+    assert experiment.training.validation_size == 5_000
+    assert experiment.training.test_size == 5_000
+    assert experiment.training.validation_source == "official_test"
 
 
 def test_primary_expert_order_is_stable() -> None:

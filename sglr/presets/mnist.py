@@ -103,7 +103,7 @@ def smoke(*, experts_per_family: int = 8) -> ExperimentConfig:
         training=replace(
             experiment.training,
             epochs=1,
-            batch_size=32,
+            batch_size=256,
             patience=1,
             train_size=256,
             validation_size=128,
@@ -128,7 +128,7 @@ def pilot(*, experts_per_family: int = 8) -> ExperimentConfig:
         ),
         training=TrainingConfig(
             epochs=5,
-            batch_size=128,
+            batch_size=256,
             learning_rate=3e-4,
             weight_decay=1e-4,
             warmup_fraction=0.05,
@@ -158,9 +158,10 @@ def full(*, experts_per_family: int = 8) -> ExperimentConfig:
             experiment.training,
             epochs=20,
             patience=5,
-            train_size=50_000,
-            validation_size=10_000,
-            num_workers=4,
+            train_size=60_000,
+            validation_size=5_000,
+            test_size=5_000,
+            validation_source="official_test",
         ),
     )
 

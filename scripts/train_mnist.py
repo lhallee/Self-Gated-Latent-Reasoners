@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, help="Override the configured random seed.")
     parser.add_argument("--device", help="Override the configured Torch device.")
     parser.add_argument("--download", action="store_true", help="Allow torchvision to download missing MNIST files.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress bars for batch logs or CI.")
     return parser
 
 
@@ -61,6 +62,7 @@ def main(argv: list[str] | None = None) -> None:
         experiment_name=experiment_name,
         download=args.download,
         command=command,
+        show_progress=not args.no_progress,
     )
     print(f"Completed run: {completed_path}")
 

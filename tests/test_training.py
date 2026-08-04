@@ -14,10 +14,11 @@ from sglr.artifacts import (
     save_json,
     save_jsonl,
 )
-from sglr.config import ExpertSpec, ModelConfig
+from sglr.config import ExperimentConfig, ExpertSpec, ModelConfig, TrainingConfig
+from sglr.data import MNISTDataLoaders
 from sglr.evaluation import evaluate_model
 from sglr.model import MNISTSGLR
-from sglr.train import run_epoch
+from sglr.train import run_epoch, train_model
 
 
 def training_model() -> MNISTSGLR:
@@ -62,12 +63,86 @@ def test_single_batch_training_with_accumulation_one() -> None:
     assert metrics.mean_route_depth >= 1.0
 
 
+def test_training_progress_reports_live_metrics(capsys: pytest.CaptureFixture[str]) -> None:
+    model = training_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    run_epoch(
+        model=model,
+        data_loader=sample_loader(),
+        device=torch.device("cpu"),
+        variant="straight_through",
+        load_balance_coefficient=0.01,
+        compute_penalty_coefficient=0.001,
+        optimizer=optimizer,
+        description="Train 1/1",
+        show_progress=True,
+    )
+
+    progress_output = capsys.readouterr().err
+    assert "Train 1/1" in progress_output
+    assert "loss=" in progress_output
+    assert "acc=" in progress_output
+    assert "depth=" in progress_output
+    assert "lr=" in progress_output
+
+
+def test_training_workflow_reports_epochs_and_validation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    model = training_model()
+    loader = sample_loader()
+    loaders = MNISTDataLoaders(
+        train=loader,
+        validation=loader,
+        test=loader,
+        train_indices=(0, 1, 2, 3),
+        validation_indices=(0, 1, 2, 3),
+        test_indices=(0, 1, 2, 3),
+        train_generator=torch.Generator().manual_seed(7),
+    )
+    experiment = ExperimentConfig(
+        model=model.config,
+        training=TrainingConfig(
+            epochs=1,
+            batch_size=4,
+            patience=1,
+            train_size=4,
+            validation_size=4,
+            test_size=4,
+            log_interval=1,
+        ),
+    )
+
+    result = train_model(
+        model=model,
+        experiment=experiment,
+        loaders=loaders,
+        device=torch.device("cpu"),
+        run_path=tmp_path,
+        show_progress=True,
+    )
+
+    captured = capsys.readouterr()
+    assert result.best_epoch == 1
+    assert "Training epochs" in captured.err
+    assert "Train 1/1" in captured.err
+    assert "Validate 1/1" in captured.err
+    assert "Epoch 1/1" in captured.out
+    assert "[new best]" in captured.out
+
+
 def test_evaluation_artifacts_round_trip(tmp_path: Path) -> None:
     model = training_model()
+    loader = sample_loader()
+    images, _, _ = next(iter(loader))
+    with torch.inference_mode():
+        expected = model.eval()(images)
 
     summary = evaluate_model(
         model=model,
-        data_loader=sample_loader(),
+        data_loader=loader,
         device=torch.device("cpu"),
         output_directory=tmp_path,
     )
@@ -78,6 +153,34 @@ def test_evaluation_artifacts_round_trip(tmp_path: Path) -> None:
     assert (tmp_path / "evaluation_summary.json").is_file()
     assert (tmp_path / "evaluation_images.npz").is_file()
     assert all(record.route_depth == len(record.route_ids) for record in records)
+    expected_routes = []
+    for batch_position in range(images.size(0)):
+        active = expected.trace.active_mask[: expected.trace.executed_steps, batch_position]  # (s,)
+        routes = expected.trace.route_ids[: expected.trace.executed_steps, batch_position][active]  # (s_active,)
+        expected_routes.append(tuple(routes[routes.lt(expected.trace.num_experts)].tolist()))
+    assert [record.route_ids for record in records] == expected_routes
+
+
+def test_evaluation_progress_reports_live_metrics(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    evaluate_model(
+        model=training_model(),
+        data_loader=sample_loader(),
+        device=torch.device("cpu"),
+        output_directory=tmp_path,
+        description="Test evaluation",
+        show_progress=True,
+    )
+
+    captured = capsys.readouterr()
+    assert "Test evaluation" in captured.err
+    assert "acc=" in captured.err
+    assert "nll=" in captured.err
+    assert "depth=" in captured.err
+    assert "ex/s=" in captured.err
+    assert "Test evaluation complete" in captured.out
 
 
 def test_same_seed_cpu_models_have_identical_routes() -> None:

@@ -59,7 +59,31 @@ RoundOneCandidate(
 
 The command-line `--epochs` and `--patience` flags control the maximum schedule
 and validation-accuracy early stopping. `--device` accepts `auto`, `cpu`, or
-`cuda`.
+`cuda`. Runs display nested candidate, epoch, and batch progress bars. The live
+postfix reports loss, accuracy, route depth, learning rate, best validation
+accuracy, and remaining early-stopping patience. Evaluation bars report running
+accuracy, NLL, route depth, and throughput. Use `--no-progress` to disable bars
+without changing the resolved experiment or its resume path.
+
+### Throughput notes
+
+MNIST is small enough to keep in system memory. The loader therefore normalizes
+each selected image once at startup and defaults to `num_workers=0`; extra worker
+processes add more coordination than useful preprocessing on this workload. If
+you explicitly set a positive worker count, the training and validation workers
+remain alive between epochs, and CUDA runs use pinned-memory transfers.
+
+On the local RTX 3070 used for development, materializing the 12,000-example
+pilot subset reduced one data-only epoch from 2.39 seconds to 0.32 seconds. For
+the canonical depth-five model, batch sizes 128, 256, 512, and 1,024 delivered
+approximately 570, 900, 1,050, and 1,070 training examples per second. Batch
+1,024 used about 5.8 GiB, so 512 is the practical depth-five choice on an 8 GiB
+card, while 256 leaves safer headroom for the deeper round-one candidates.
+
+Batch size changes the number of optimizer updates and is therefore an
+experimental hyperparameter, not merely a systems setting. Give a changed batch
+size a distinct preset name and confirm validation accuracy rather than mixing
+it into an existing run directory.
 
 ## Change the model and data preset
 

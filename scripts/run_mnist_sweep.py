@@ -6,6 +6,8 @@ import argparse
 import sys
 from dataclasses import replace
 
+from tqdm.auto import tqdm
+
 from scripts.arguments import positive_int
 from sglr.artifacts import run_directory, run_is_complete, validate_run_config
 from sglr.config import with_run_overrides
@@ -26,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", help="Override the configured Torch device for every run.")
     parser.add_argument("--download", action="store_true", help="Allow the first run to download missing MNIST files.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress bars for batch logs or CI.")
     return parser
 
 
@@ -41,41 +44,82 @@ def main(argv: list[str] | None = None) -> None:
     completed = 0
     skipped = 0
     allow_download = args.download
+    report = print if args.no_progress else tqdm.write
+    run_grid = [
+        (variant, seed)
+        for variant in base_experiment.sweep.variants
+        for seed in base_experiment.sweep.seeds
+    ]
 
-    for variant in base_experiment.sweep.variants:
-        for seed in base_experiment.sweep.seeds:
-            experiment = with_run_overrides(base_experiment, routing_mode=variant, seed=seed)
-            if args.device is not None:
-                experiment = replace(
-                    experiment,
-                    training=replace(experiment.training, device=args.device),
-                )
-            run_path = run_directory(
-                experiment.training.output_root,
-                experiment_name,
-                variant,
-                seed,
+    runs = tqdm(
+        run_grid,
+        desc=f"Sweep {experiment_name}",
+        unit="run",
+        dynamic_ncols=True,
+        disable=args.no_progress,
+    )
+    for variant, seed in runs:
+        runs.set_postfix(
+            {
+                "variant": variant,
+                "seed": seed,
+                "completed": completed,
+                "skipped": skipped,
+            },
+            refresh=True,
+        )
+        experiment = with_run_overrides(base_experiment, routing_mode=variant, seed=seed)
+        if args.device is not None:
+            experiment = replace(
+                experiment,
+                training=replace(experiment.training, device=args.device),
             )
-            if run_is_complete(run_path):
-                validate_run_config(run_path, experiment)
-                print(f"Skipping completed run: {run_path}")
-                skipped += 1
-                continue
+        run_path = run_directory(
+            experiment.training.output_root,
+            experiment_name,
+            variant,
+            seed,
+        )
+        if run_is_complete(run_path):
+            validate_run_config(run_path, experiment)
+            message = f"Skipping completed {variant}, seed {seed}: {run_path}"
+            report(message)
+            skipped += 1
+            runs.set_postfix(
+                {
+                    "variant": variant,
+                    "seed": seed,
+                    "completed": completed,
+                    "skipped": skipped,
+                },
+                refresh=True,
+            )
+            continue
 
-            command = [
-                sys.executable,
-                "-m",
-                "scripts.run_mnist_sweep",
-                *(argv if argv is not None else sys.argv[1:]),
-            ]
-            run_experiment(
-                experiment=experiment,
-                experiment_name=experiment_name,
-                download=allow_download,
-                command=command,
-            )
-            allow_download = False
-            completed += 1
+        command = [
+            sys.executable,
+            "-m",
+            "scripts.run_mnist_sweep",
+            *(argv if argv is not None else sys.argv[1:]),
+        ]
+        run_experiment(
+            experiment=experiment,
+            experiment_name=experiment_name,
+            download=allow_download,
+            command=command,
+            show_progress=not args.no_progress,
+        )
+        allow_download = False
+        completed += 1
+        runs.set_postfix(
+            {
+                "variant": variant,
+                "seed": seed,
+                "completed": completed,
+                "skipped": skipped,
+            },
+            refresh=True,
+        )
 
     print(f"Sweep complete: {completed} trained or resumed, {skipped} skipped")
 

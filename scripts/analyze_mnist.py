@@ -74,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint_parser.add_argument("--device", default="auto", help="Torch device used for evaluation.")
     checkpoint_parser.add_argument("--download", action="store_true", help="Allow missing MNIST files to download.")
     checkpoint_parser.add_argument("--permutations", type=_positive_int, default=1000, help="MI null permutations.")
+    checkpoint_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the checkpoint evaluation progress bar.",
+    )
     return parser
 
 
@@ -159,7 +164,7 @@ def analyze_checkpoint(args: argparse.Namespace) -> list[Path]:
         raise ValueError("Run manifest variant or seed disagrees with its resolved configuration")
     seed_everything(experiment.training.seed)
     device = select_device(args.device)
-    loaders = build_mnist_loaders(experiment.training, download=args.download)
+    loaders = build_mnist_loaders(experiment.training, download=args.download, device=device)
     model = build_mnist_model(experiment.model).to(device)
     checkpoint = load_checkpoint(run_directory / "best_model.pt", device)
     model.load_state_dict(checkpoint["model_state"])
@@ -172,6 +177,8 @@ def analyze_checkpoint(args: argparse.Namespace) -> list[Path]:
         device=device,
         output_directory=run_directory,
         num_classes=experiment.model.num_classes,
+        description="Checkpoint evaluation",
+        show_progress=not args.no_progress,
     )
     summary = {**preserved_summary, **reevaluated_summary}
     summary.update(

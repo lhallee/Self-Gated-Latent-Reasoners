@@ -9,7 +9,7 @@ from typing import Sequence
 
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 
 from sglr.config import TrainingConfig
 
@@ -20,7 +20,7 @@ MNIST_STANDARD_DEVIATION = (0.3081,)
 
 @dataclass(frozen=True, slots=True)
 class MNISTDataLoaders:
-    """Loaders whose batches contain images, labels, and official MNIST indices."""
+    """Loaders whose batches contain images, labels, and source-dataset indices."""
 
     train: DataLoader[tuple[Tensor, Tensor, Tensor]]
     validation: DataLoader[tuple[Tensor, Tensor, Tensor]]
@@ -31,22 +31,25 @@ class MNISTDataLoaders:
     train_generator: torch.Generator
 
 
-class IndexedSubset(Dataset[tuple[Tensor, Tensor, Tensor]]):
-    """Expose source-dataset indices alongside samples from a fixed subset."""
+class TensorMNISTSubset(Dataset[tuple[Tensor, Tensor, Tensor]]):
+    """Materialize a normalized MNIST subset once instead of transforming every epoch."""
 
-    def __init__(self, dataset: Dataset[tuple[Tensor, int]], indices: Sequence[int]) -> None:
-        self.dataset = dataset
-        self.indices = tuple(int(index) for index in indices)
+    def __init__(self, images: Tensor, labels: Tensor, indices: Sequence[int]) -> None:
+        source_indices = torch.as_tensor(indices, dtype=torch.long)  # (n,)
+        normalized_images = images.index_select(0, source_indices).unsqueeze(1).to(torch.float32)  # (n, 1, 28, 28)
+        normalized_images.div_(255.0).sub_(MNIST_MEAN[0]).div_(MNIST_STANDARD_DEVIATION[0])
+        self.images = normalized_images  # (n, 1, 28, 28)
+        self.labels = labels.index_select(0, source_indices).to(torch.long)  # (n,)
+        self.indices = source_indices  # (n,)
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, position: int) -> tuple[Tensor, Tensor, Tensor]:
-        source_index = self.indices[position]
-        image, label = self.dataset[source_index]  # image: (1, 28, 28); label: scalar
-        label_tensor = torch.as_tensor(label, dtype=torch.long)  # ()
-        index_tensor = torch.tensor(source_index, dtype=torch.long)  # ()
-        return image, label_tensor, index_tensor
+        image = self.images[position]  # (1, 28, 28)
+        label = self.labels[position]  # ()
+        source_index = self.indices[position]  # ()
+        return image, label, source_index
 
 
 def stratified_split_indices(
@@ -114,43 +117,97 @@ def _allocate_counts_from_capacity(capacities: Tensor, requested_size: int) -> T
     return allocated  # (c,)
 
 
-def build_mnist_loaders(config: TrainingConfig, download: bool = False) -> MNISTDataLoaders:
-    """Build deterministic train/validation splits and a reserved test loader."""
+def mnist_split_indices(
+    official_train_labels: Tensor,
+    official_test_labels: Tensor,
+    config: TrainingConfig,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Resolve train, validation, and test indices without loading image tensors."""
+
+    if config.validation_source == "official_train":
+        train_indices, validation_indices = stratified_split_indices(
+            official_train_labels,
+            config.train_size,
+            config.validation_size,
+            config.seed,
+        )
+        requested_test_size = (
+            official_test_labels.numel()
+            if config.test_size == 0
+            else min(config.test_size, official_test_labels.numel())
+        )
+        test_indices, _ = stratified_split_indices(
+            official_test_labels,
+            requested_test_size,
+            0,
+            config.seed,
+        )
+    else:
+        train_indices, _ = stratified_split_indices(
+            official_train_labels,
+            config.train_size,
+            0,
+            config.seed,
+        )
+        validation_indices, test_indices = stratified_split_indices(
+            official_test_labels,
+            config.validation_size,
+            config.test_size,
+            config.seed,
+        )
+
+    return train_indices, validation_indices, test_indices
+
+
+def build_mnist_loaders(
+    config: TrainingConfig,
+    download: bool = False,
+    device: torch.device | str | None = None,
+) -> MNISTDataLoaders:
+    """Build deterministic, disjoint MNIST loaders from the configured sources."""
 
     from torchvision.datasets import MNIST
-    from torchvision.transforms import Compose, Normalize, ToTensor
-
-    transform = Compose([ToTensor(), Normalize(MNIST_MEAN, MNIST_STANDARD_DEVIATION)])
     data_root = Path(config.data_root)
-    official_train = MNIST(data_root, train=True, download=download, transform=transform)
-    official_test = MNIST(data_root, train=False, download=download, transform=transform)
+    official_train = MNIST(data_root, train=True, download=download)
+    official_test = MNIST(data_root, train=False, download=download)
 
-    train_indices, validation_indices = stratified_split_indices(
+    train_indices, validation_indices, test_indices = mnist_split_indices(
         official_train.targets,
-        config.train_size,
-        config.validation_size,
-        config.seed,
+        official_test.targets,
+        config,
     )
-    requested_test_size = len(official_test) if config.test_size == 0 else min(config.test_size, len(official_test))
-    test_indices, _ = stratified_split_indices(official_test.targets, requested_test_size, 0, config.seed)
+    if config.validation_source == "official_train":
+        validation_images = official_train.data
+        validation_labels = official_train.targets
+    else:
+        validation_images = official_test.data
+        validation_labels = official_test.targets
 
-    train_dataset = IndexedSubset(official_train, train_indices)
-    validation_dataset = IndexedSubset(official_train, validation_indices)
-    test_dataset = IndexedSubset(official_test, test_indices)
+    train_dataset = TensorMNISTSubset(official_train.data, official_train.targets, train_indices)
+    validation_dataset = TensorMNISTSubset(validation_images, validation_labels, validation_indices)
+    test_dataset = TensorMNISTSubset(official_test.data, official_test.targets, test_indices)
     loader_generator = torch.Generator().manual_seed(config.seed)
+    selected_device = torch.device(device) if device is not None else None
+    pin_memory = selected_device.type == "cuda" if selected_device is not None else torch.cuda.is_available()
     loader_options = {
         "batch_size": config.batch_size,
         "num_workers": config.num_workers,
-        "pin_memory": torch.cuda.is_available(),
+        "pin_memory": pin_memory,
         "worker_init_fn": _seed_worker,
     }
     train_loader = DataLoader(
         train_dataset,
         shuffle=True,
         generator=loader_generator,
+        persistent_workers=config.num_workers > 0,
         **loader_options,
     )
-    validation_loader = DataLoader(validation_dataset, shuffle=False, **loader_options)
+    validation_loader = DataLoader(
+        validation_dataset,
+        shuffle=False,
+        persistent_workers=config.num_workers > 0,
+        **loader_options,
+    )
     test_loader = DataLoader(test_dataset, shuffle=False, **loader_options)
     return MNISTDataLoaders(
         train=train_loader,

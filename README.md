@@ -91,8 +91,8 @@ Python 3.11 or newer is required.
 python -m pip install -r requirements.txt
 ```
 
-The environment contains PyTorch, torchvision, NumPy, Matplotlib, pytest, Ruff,
-and mypy. Historical Streamlit, graph, and probe workflows are not dependencies.
+The environment contains PyTorch, torchvision, NumPy, Matplotlib, tqdm, pytest,
+Ruff, and mypy. Historical Streamlit, graph, and probe workflows are not dependencies.
 
 ## Commands
 
@@ -127,6 +127,13 @@ python -m scripts.analyze_mnist sweep --sweep-root runs/focused --output-dir fig
 ```
 
 CLI flags use kebab-case; typed Python preset functions are the single source for experiment defaults.
+Training commands show nested run, epoch, batch, validation, and evaluation
+progress with live loss, accuracy, route depth, learning rate, throughput, and
+early-stopping state. Add `--no-progress` for CI or plain redirected logs.
+MNIST subsets are normalized and materialized as contiguous tensors once when a
+run starts. Training uses pinned host memory only for CUDA runs, and configured
+workers remain alive across epochs. Evaluation transfers one compact batch trace
+to the CPU rather than synchronizing the GPU for every example and route.
 Use `--experts-per-family 16` for 48 experts or edit
 `sglr/presets/mnist.py` to give the MLP, attention, and convolution families
 different counts. The canonical 24-expert order remains stable so old

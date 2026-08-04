@@ -28,6 +28,7 @@ def test_train_parser_accepts_python_preset_and_expert_override() -> None:
             "17",
             "--device",
             "cpu",
+            "--no-progress",
         ]
     )
     experiment = with_run_overrides(
@@ -40,6 +41,7 @@ def test_train_parser_accepts_python_preset_and_expert_override() -> None:
     assert experiment.model.routing_mode == "hard_argmax"
     assert experiment.training.seed == 17
     assert args.device == "cpu"
+    assert args.no_progress
 
 
 @pytest.mark.parametrize("value", ["0", "-1"])

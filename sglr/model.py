@@ -76,6 +76,9 @@ class SGLRCore(nn.Module):
         source_gates: Tensor | None = None,
     ) -> Tensor:
         # hidden_states: (b, l, d); source_ids: (b,); source_gates: (b, e + 1)
+        if source_gates is None and not self.training:
+            return self._sparse_router_logits(hidden_states, attention_mask, source_ids)  # (b, e + 1)
+
         logits_by_source = torch.stack(
             [router(hidden_states, attention_mask) for router in self.routers],
             dim=1,
@@ -84,6 +87,43 @@ class SGLRCore(nn.Module):
             return torch.einsum("bs,bsr->br", source_gates, logits_by_source)  # (b, e + 1)
         batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)  # (b,)
         return logits_by_source[batch_indices, source_ids]  # (b, e + 1)
+
+    def _sparse_router_logits(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor | None,
+        source_ids: Tensor,
+    ) -> Tensor:
+        # hidden_states: (b, l, d); attention_mask: (b, l); source_ids: (b,)
+        sorted_source_ids, source_order = source_ids.sort()  # (b,), (b,)
+        unique_sources, source_counts = torch.unique_consecutive(
+            sorted_source_ids,
+            return_counts=True,
+        )  # (n_sources,), (n_sources,)
+        source_plan = torch.stack((unique_sources, source_counts), dim=-1).cpu().tolist()
+        sorted_states = hidden_states.index_select(0, source_order)  # (b, l, d)
+        sorted_attention_mask = (
+            None if attention_mask is None else attention_mask.index_select(0, source_order)
+        )  # (b, l)
+
+        sorted_logits: list[Tensor] = []
+        offset = 0
+        for source_index, source_count in source_plan:
+            next_offset = offset + source_count
+            source_states = sorted_states[offset:next_offset]  # (n_source, l, d)
+            source_attention_mask = (
+                None
+                if sorted_attention_mask is None
+                else sorted_attention_mask[offset:next_offset]
+            )  # (n_source, l)
+            sorted_logits.append(
+                self.routers[source_index](source_states, source_attention_mask)
+            )  # (n_source, e + 1)
+            offset = next_offset
+
+        logits_by_sample = torch.cat(sorted_logits, dim=0)  # (b, e + 1)
+        router_logits = torch.empty_like(logits_by_sample)  # (b, e + 1)
+        return router_logits.index_copy(0, source_order, logits_by_sample)  # (b, e + 1)
 
     def _dense_candidates(self, hidden_states: Tensor, attention_mask: Tensor | None) -> Tensor:
         # hidden_states: (b, l, d); attention_mask: (b, l)
@@ -101,18 +141,32 @@ class SGLRCore(nn.Module):
         active_mask: Tensor,
     ) -> Tensor:
         # hidden_states: (b, l, d); selected_routes: (b,); active_mask: (b,)
+        dispatch_routes = torch.where(
+            active_mask & selected_routes.lt(self.config.num_experts),
+            selected_routes,
+            torch.full_like(selected_routes, self.exit_route_index),
+        )  # (b,)
+        sorted_routes, route_order = dispatch_routes.sort()  # (b,), (b,)
+        unique_routes, route_counts = torch.unique_consecutive(
+            sorted_routes,
+            return_counts=True,
+        )  # (n_routes,), (n_routes,)
+        dispatch_plan = torch.stack((unique_routes, route_counts), dim=-1).cpu().tolist()
+
         next_hidden_states = hidden_states  # (b, l, d)
-        for expert_index, expert in enumerate(self.experts):
-            selected_mask = active_mask & selected_routes.eq(expert_index)  # (b,)
-            selected_indices = torch.nonzero(selected_mask, as_tuple=False).flatten()  # (n_selected,)
-            if selected_indices.numel() == 0:
+        offset = 0
+        for expert_index, selected_count in dispatch_plan:
+            next_offset = offset + selected_count
+            if expert_index == self.exit_route_index:
+                offset = next_offset
                 continue
 
+            selected_indices = route_order[offset:next_offset]  # (n_selected,)
             selected_states = hidden_states.index_select(0, selected_indices)  # (n_selected, l, d)
             selected_attention_mask = (
                 None if attention_mask is None else attention_mask.index_select(0, selected_indices)
             )  # (n_selected, l)
-            selected_candidates = selected_states + expert(
+            selected_candidates = selected_states + self.experts[expert_index](
                 selected_states,
                 selected_attention_mask,
             )  # (n_selected, l, d)
@@ -121,6 +175,7 @@ class SGLRCore(nn.Module):
                 selected_indices,
                 selected_candidates,
             )  # (b, l, d)
+            offset = next_offset
         return next_hidden_states  # (b, l, d)
 
     def forward(
