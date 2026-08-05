@@ -29,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", help="Override the configured Torch device.")
     parser.add_argument("--download", action="store_true", help="Allow torchvision to download missing MNIST files.")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress bars for batch logs or CI.")
+    parser.add_argument(
+        "--validation-only",
+        action="store_true",
+        help="Evaluate the validation split and leave the sealed test split untouched.",
+    )
     return parser
 
 
@@ -44,7 +49,12 @@ def main(argv: list[str] | None = None) -> None:
             experiment,
             training=replace(experiment.training, device=args.device),
         )
-    experiment_name = experiment.experiment_name
+    evaluation_split = "validation" if args.validation_only else "test"
+    experiment_name = (
+        f"{experiment.experiment_name}_validation"
+        if args.validation_only
+        else experiment.experiment_name
+    )
     run_path = run_directory(
         experiment.training.output_root,
         experiment_name,
@@ -63,6 +73,7 @@ def main(argv: list[str] | None = None) -> None:
         download=args.download,
         command=command,
         show_progress=not args.no_progress,
+        evaluation_split=evaluation_split,
     )
     print(f"Completed run: {completed_path}")
 

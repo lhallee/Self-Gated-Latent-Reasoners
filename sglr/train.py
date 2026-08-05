@@ -7,12 +7,13 @@ import math
 import os
 import random
 import time
-from dataclasses import asdict, dataclass
-from pathlib import Path
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Literal
 from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -27,7 +28,7 @@ from sglr.artifacts import (
     save_json,
     validate_run_config,
 )
-from sglr.config import ExperimentConfig
+from sglr.config import ExperimentConfig, ModelConfig, TrainingConfig
 from sglr.data import MNISTDataLoaders, build_mnist_loaders
 from sglr.evaluation import evaluate_model
 from sglr.model import MNISTOutput, build_mnist_model, count_parameters
@@ -252,6 +253,16 @@ def _epoch_metrics(metric_totals: Tensor, total_examples: int) -> EpochMetrics:
     )
 
 
+def _routing_config_for_epoch(
+    model_config: ModelConfig,
+    training_config: TrainingConfig,
+    epoch: int,
+) -> ModelConfig:
+    if epoch <= training_config.routing_warmup_epochs:
+        return replace(model_config, min_steps=1, max_steps=1)
+    return model_config
+
+
 def train_model(
     model: nn.Module,
     experiment: ExperimentConfig,
@@ -324,23 +335,37 @@ def train_model(
             )
             report(message)
             break
-        train_metrics = run_epoch(
-            model=model,
-            data_loader=loaders.train,
-            device=device,
-            variant=experiment.model.routing_mode,
-            expert_families=expert_families,
-            load_balance_coefficient=config.load_balance_coefficient,
-            within_family_balance_weight=config.within_family_balance_weight,
-            route_mi_coefficient=config.route_mi_coefficient,
-            compute_penalty_coefficient=config.compute_penalty_coefficient,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            grad_accum_steps=config.grad_accum_steps,
-            log_interval=config.log_interval,
-            description=f"Train {epoch}/{config.epochs}",
-            show_progress=show_progress,
+        training_model_config = _routing_config_for_epoch(
+            experiment.model,
+            config,
+            epoch,
         )
+        routed_core = getattr(model, "core", None)
+        if training_model_config != experiment.model and routed_core is None:
+            raise TypeError("Routing warmup requires a model with a routed core")
+        if routed_core is not None:
+            routed_core.config = training_model_config
+        try:
+            train_metrics = run_epoch(
+                model=model,
+                data_loader=loaders.train,
+                device=device,
+                variant=experiment.model.routing_mode,
+                expert_families=expert_families,
+                load_balance_coefficient=config.load_balance_coefficient,
+                within_family_balance_weight=config.within_family_balance_weight,
+                route_mi_coefficient=config.route_mi_coefficient,
+                compute_penalty_coefficient=config.compute_penalty_coefficient,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                grad_accum_steps=config.grad_accum_steps,
+                log_interval=config.log_interval,
+                description=f"Train {epoch}/{config.epochs}",
+                show_progress=show_progress,
+            )
+        finally:
+            if routed_core is not None:
+                routed_core.config = experiment.model
         validation_metrics = run_epoch(
             model=model,
             data_loader=loaders.validation,
@@ -444,8 +469,12 @@ def run_experiment(
     download: bool = False,
     command: list[str] | None = None,
     show_progress: bool = True,
+    evaluation_split: Literal["validation", "test"] = "test",
 ) -> Path:
+    run_start = time.perf_counter()
     experiment.validate()
+    if evaluation_split not in {"validation", "test"}:
+        raise ValueError("evaluation_split must be 'validation' or 'test'")
     report = tqdm.write if show_progress else print
     seed_everything(experiment.training.seed)
     device = select_device(experiment.training.device)
@@ -506,6 +535,8 @@ def run_experiment(
                 "validation_index_sha256": _index_digest(loaders.validation_indices),
                 "test_index_sha256": _index_digest(loaders.test_indices),
             },
+            "evaluation_split": evaluation_split,
+            "test_set_accessed": evaluation_split == "test",
         }
     )
     save_json(manifest_path, manifest)
@@ -530,17 +561,20 @@ def run_experiment(
     report(
         f"Training finished in {training_result.elapsed_seconds / 60:.1f} min; "
         f"best validation accuracy={training_result.best_validation_accuracy:.3f} "
-        f"at epoch {training_result.best_epoch}. Evaluating the best checkpoint..."
+        f"at epoch {training_result.best_epoch}. Evaluating the best checkpoint "
+        f"on {evaluation_split}..."
     )
+    evaluation_loader = loaders.validation if evaluation_split == "validation" else loaders.test
     evaluation_summary = evaluate_model(
         model=model,
-        data_loader=loaders.test,
+        data_loader=evaluation_loader,
         device=device,
         output_directory=run_path,
         num_classes=experiment.model.num_classes,
-        description="Test evaluation",
+        description=f"{evaluation_split.title()} evaluation",
         show_progress=show_progress,
     )
+    end_to_end_elapsed_seconds = time.perf_counter() - run_start
     evaluation_summary.update(
         {
             "variant": variant,
@@ -552,6 +586,8 @@ def run_experiment(
             "training_elapsed_seconds": training_result.elapsed_seconds,
             "training_throughput_examples_per_second": training_result.throughput_examples_per_second,
             "training_peak_cuda_memory_bytes": training_result.peak_cuda_memory_bytes,
+            "evaluation_split": evaluation_split,
+            "end_to_end_elapsed_seconds": end_to_end_elapsed_seconds,
         }
     )
     save_json(run_path / "evaluation_summary.json", evaluation_summary)
@@ -562,6 +598,8 @@ def run_experiment(
             "training_throughput_examples_per_second": training_result.throughput_examples_per_second,
             "training_peak_cuda_memory_bytes": training_result.peak_cuda_memory_bytes,
             "evaluation": evaluation_summary,
+            "evaluation_split": evaluation_split,
+            "end_to_end_elapsed_seconds": end_to_end_elapsed_seconds,
             "best_epoch": training_result.best_epoch,
             "best_validation_accuracy": training_result.best_validation_accuracy,
             "checkpoints": {
@@ -581,10 +619,11 @@ def run_experiment(
         },
     )
     completion_message = (
-        f"Run complete: test accuracy={float(evaluation_summary['accuracy']):.3f}, "
+        f"Run complete: {evaluation_split} accuracy={float(evaluation_summary['accuracy']):.3f}, "
         f"NLL={float(evaluation_summary['nll']):.4f}, "
         f"mean depth={float(evaluation_summary['mean_route_depth']):.2f}, "
-        f"training time={training_result.elapsed_seconds / 60:.1f} min"
+        f"training time={training_result.elapsed_seconds / 60:.1f} min, "
+        f"end-to-end time={end_to_end_elapsed_seconds:.1f} s"
     )
     report(completion_message)
     return run_path

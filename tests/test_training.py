@@ -18,7 +18,7 @@ from sglr.config import ExperimentConfig, ExpertSpec, ModelConfig, TrainingConfi
 from sglr.data import MNISTDataLoaders
 from sglr.evaluation import evaluate_model
 from sglr.model import MNISTSGLR
-from sglr.train import run_epoch, train_model
+from sglr.train import _routing_config_for_epoch, run_epoch, train_model
 
 
 def training_model() -> MNISTSGLR:
@@ -41,6 +41,23 @@ def sample_loader() -> DataLoader:
     labels = torch.tensor([0, 1, 2, 3])
     indices = torch.arange(4)
     return DataLoader(TensorDataset(images, labels, indices), batch_size=4)
+
+
+def test_routing_curriculum_uses_shallow_training_then_full_evaluation_depth() -> None:
+    model_config = training_model().config
+    training_config = TrainingConfig(
+        epochs=5,
+        routing_warmup_epochs=2,
+        train_size=4,
+        validation_size=4,
+    )
+
+    warmup_config = _routing_config_for_epoch(model_config, training_config, epoch=2)
+    full_config = _routing_config_for_epoch(model_config, training_config, epoch=3)
+
+    assert warmup_config.min_steps == 1
+    assert warmup_config.max_steps == 1
+    assert full_config == model_config
 
 
 def test_single_batch_training_with_accumulation_one() -> None:

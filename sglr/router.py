@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
+
+from dataclasses import dataclass
 from torch import Tensor
 
 
@@ -67,6 +67,69 @@ def straight_through_one_hot(route_probs: Tensor) -> tuple[Tensor, Tensor]:
     hard_gates = torch.nn.functional.one_hot(route_ids, route_probs.size(-1)).to(route_probs.dtype)  # (b, e + 1)
     gates = hard_gates + route_probs - route_probs.detach()  # (b, e + 1)
     return gates, route_ids
+
+
+def sinkhorn_balanced_probabilities(
+    router_logits: Tensor,
+    iterations: int,
+    temperature: float,
+) -> Tensor:
+    """Balance expert probability mass across a batch with Sinkhorn updates."""
+    # router_logits: (b, e)
+    if router_logits.ndim != 2:
+        raise ValueError("router_logits must have shape (batch, experts)")
+    if iterations <= 0:
+        raise ValueError("iterations must be positive")
+    if temperature <= 0.0:
+        raise ValueError("temperature must be positive")
+
+    log_assignments = router_logits / temperature  # (b, e)
+    for _ in range(iterations):
+        log_assignments = log_assignments - torch.logsumexp(
+            log_assignments,
+            dim=-1,
+            keepdim=True,
+        )  # (b, e)
+        log_assignments = log_assignments - torch.logsumexp(
+            log_assignments,
+            dim=0,
+            keepdim=True,
+        )  # (b, e)
+    return log_assignments.softmax(dim=-1)  # (b, e)
+
+
+def capacity_balanced_routes(route_scores: Tensor) -> Tensor:
+    """Assign top-1 routes under equal per-expert batch capacities."""
+    # route_scores: (b, e)
+    if route_scores.ndim != 2:
+        raise ValueError("route_scores must have shape (batch, experts)")
+    b, e = route_scores.shape
+    if b == 0 or e == 0:
+        raise ValueError("route_scores must have non-empty batch and expert dimensions")
+
+    base_capacity, extra_capacity = divmod(b, e)
+    remaining_capacity = [
+        base_capacity + int(expert_index < extra_capacity)
+        for expert_index in range(e)
+    ]
+    flat_preference_order = (
+        route_scores.detach().flatten().argsort(descending=True).cpu().tolist()
+    )
+    assignments = [-1] * b
+    assigned_count = 0
+    for flat_index in flat_preference_order:
+        sample_index, expert_index = divmod(flat_index, e)
+        if assignments[sample_index] >= 0 or remaining_capacity[expert_index] == 0:
+            continue
+        assignments[sample_index] = expert_index
+        remaining_capacity[expert_index] -= 1
+        assigned_count += 1
+        if assigned_count == b:
+            break
+
+    if assigned_count != b:
+        raise RuntimeError("Capacity routing did not assign every sample")
+    return torch.tensor(assignments, device=route_scores.device, dtype=torch.long)  # (b,)
 
 
 def hierarchical_load_balancing_loss(

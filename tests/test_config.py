@@ -42,6 +42,76 @@ def test_diverse_full_preset_enables_hierarchical_balance_and_route_information(
     assert experiment.training.compute_penalty_coefficient == 0.025
 
 
+def test_fast_full_preset_uses_shallow_sparse_training() -> None:
+    experiment = get_mnist_preset("fast_full")
+
+    assert experiment.model.routing_mode == "hard_argmax"
+    assert experiment.model.max_steps == 2
+    assert experiment.training.batch_size == 2_048
+    assert experiment.training.train_size == 60_000
+    assert experiment.training.validation_source == "official_test"
+
+
+def test_fast_cnn_full_preset_strengthens_encoder_and_readout() -> None:
+    experiment = get_mnist_preset("fast_cnn_full")
+
+    assert experiment.model.encoder_width == 32
+    assert experiment.model.readout_hidden_size == 128
+    assert experiment.model.parameter_budget is None
+
+
+def test_fast_cnn_balanced_full_preset_increases_within_family_pressure() -> None:
+    experiment = get_mnist_preset("fast_cnn_balanced_full")
+
+    assert experiment.training.load_balance_coefficient == 0.2
+    assert experiment.training.within_family_balance_weight == 2.0
+
+
+def test_fast_cnn_depth5_full_preset_requires_five_experts() -> None:
+    experiment = get_mnist_preset("fast_cnn_depth5_full")
+
+    assert experiment.model.min_steps == 5
+    assert experiment.model.max_steps == 6
+    assert experiment.training.batch_size == 4_096
+    assert experiment.training.epochs == 8
+    assert experiment.training.patience == 2
+
+
+def test_fast_cnn_depth5_scaled_full_controls_deep_routing() -> None:
+    experiment = get_mnist_preset("fast_cnn_depth5_scaled_full")
+
+    assert experiment.model.expert_residual_scale == 0.1
+    assert experiment.training.load_balance_coefficient == 0.5
+    assert experiment.training.compute_penalty_coefficient == 3.0
+
+
+def test_fast_cnn_depth5_curriculum_full_warms_up_shallow_routing() -> None:
+    experiment = get_mnist_preset("fast_cnn_depth5_curriculum_full")
+
+    assert experiment.training.epochs == 10
+    assert experiment.training.routing_warmup_epochs == 4
+    assert experiment.training.patience == 3
+
+
+def test_fast_cnn_depth5_shared_router_full_reuses_one_router() -> None:
+    experiment = get_mnist_preset("fast_cnn_depth5_shared_router_full")
+
+    assert experiment.model.share_router_across_sources
+
+
+def test_fast_cnn_depth5_sinkhorn_full_balances_hard_assignments() -> None:
+    experiment = get_mnist_preset("fast_cnn_depth5_sinkhorn_full")
+
+    assert experiment.model.sinkhorn_routing_iterations == 100
+    assert experiment.model.sinkhorn_temperature == 0.05
+
+
+def test_fast_cnn_depth5_capacity_full_balances_evaluation_assignments() -> None:
+    experiment = get_mnist_preset("fast_cnn_depth5_capacity_full")
+
+    assert experiment.model.capacity_balanced_evaluation
+
+
 def test_primary_expert_order_is_stable() -> None:
     assert make_expert_pool() == (
         ExpertSpec("mlp_008", "mlp", hidden_size=8),
@@ -109,7 +179,10 @@ def test_manifest_configuration_round_trip() -> None:
 
 
 def test_unknown_preset_lists_valid_names() -> None:
-    with pytest.raises(ValueError, match="smoke, pilot, full, diverse_full, focused"):
+    with pytest.raises(
+        ValueError,
+        match="fast_cnn_depth5_capacity_full",
+    ):
         get_mnist_preset("unknown")
 
 

@@ -55,6 +55,9 @@ class ExpertSpec:
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     hidden_size: int = 48
+    encoder_width: int = 0
+    expert_residual_scale: float = 1.0
+    readout_hidden_size: int = 0
     image_size: int = 28
     patch_size: int = 4
     num_classes: int = 10
@@ -62,6 +65,10 @@ class ModelConfig:
     min_steps: int = 1
     router_hidden_size: int = 16
     router_dropout: float = 0.0
+    share_router_across_sources: bool = False
+    capacity_balanced_evaluation: bool = False
+    sinkhorn_routing_iterations: int = 0
+    sinkhorn_temperature: float = 1.0
     routing_mode: str = "straight_through"
     experts: tuple[ExpertSpec, ...] = field(default_factory=tuple)
     parameter_budget: int | None = 200_000
@@ -83,10 +90,16 @@ class ModelConfig:
     def validate(self) -> None:
         if self.hidden_size <= 0:
             raise ValueError("hidden_size must be positive")
+        if self.encoder_width < 0 or self.readout_hidden_size < 0:
+            raise ValueError("encoder_width and readout_hidden_size must be non-negative")
+        if self.expert_residual_scale <= 0.0:
+            raise ValueError("expert_residual_scale must be positive")
         if self.image_size <= 0 or self.patch_size <= 0:
             raise ValueError("image_size and patch_size must be positive")
         if self.image_size % self.patch_size != 0:
             raise ValueError("image_size must be divisible by patch_size")
+        if self.encoder_width and self.patch_size != 4:
+            raise ValueError("The convolutional encoder requires patch_size=4")
         if self.num_classes <= 1:
             raise ValueError("num_classes must be greater than one")
         if self.max_steps <= 0:
@@ -95,6 +108,12 @@ class ModelConfig:
             raise ValueError("min_steps must be between one and max_steps")
         if self.router_hidden_size <= 0:
             raise ValueError("router_hidden_size must be positive")
+        if self.sinkhorn_routing_iterations < 0:
+            raise ValueError("sinkhorn_routing_iterations must be non-negative")
+        if self.sinkhorn_temperature <= 0.0:
+            raise ValueError("sinkhorn_temperature must be positive")
+        if self.capacity_balanced_evaluation and self.sinkhorn_routing_iterations == 0:
+            raise ValueError("capacity-balanced evaluation requires Sinkhorn routing")
         if not 0.0 <= self.router_dropout < 1.0:
             raise ValueError("router_dropout must be in [0, 1)")
         if self.routing_mode not in ROUTING_MODES:
@@ -121,6 +140,7 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     warmup_fraction: float = 0.05
     grad_accum_steps: int = 1
+    routing_warmup_epochs: int = 0
     load_balance_coefficient: float = 0.01
     within_family_balance_weight: float = 1.0
     route_mi_coefficient: float = 0.0
@@ -148,8 +168,12 @@ class TrainingConfig:
         for name, value in positive_values.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
-        if self.test_size < 0 or self.num_workers < 0:
-            raise ValueError("test_size and num_workers must be non-negative")
+        if self.test_size < 0 or self.num_workers < 0 or self.routing_warmup_epochs < 0:
+            raise ValueError(
+                "test_size, num_workers, and routing_warmup_epochs must be non-negative"
+            )
+        if self.routing_warmup_epochs >= self.epochs:
+            raise ValueError("routing_warmup_epochs must be less than epochs")
         if self.validation_source not in {"official_train", "official_test"}:
             raise ValueError("validation_source must be 'official_train' or 'official_test'")
         if not 0.0 <= self.warmup_fraction < 1.0:

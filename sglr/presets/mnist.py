@@ -187,6 +187,165 @@ def diverse_full(*, experts_per_family: int = 8) -> ExperimentConfig:
     return configured
 
 
+def fast_full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = full(experts_per_family=experts_per_family)
+    configured = replace(
+        experiment,
+        experiment_name="fast_full",
+        model=replace(
+            experiment.model,
+            max_steps=2,
+            routing_mode="hard_argmax",
+        ),
+        training=replace(
+            experiment.training,
+            epochs=12,
+            batch_size=2_048,
+            learning_rate=2e-3,
+            warmup_fraction=0.02,
+            load_balance_coefficient=0.1,
+            route_mi_coefficient=0.05,
+            compute_penalty_coefficient=0.5,
+            patience=3,
+            log_interval=0,
+        ),
+    )
+    configured.validate()
+    return configured
+
+
+def fast_cnn_full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = fast_full(experts_per_family=experts_per_family)
+    configured = replace(
+        experiment,
+        experiment_name="fast_cnn_full",
+        model=replace(
+            experiment.model,
+            encoder_width=32,
+            parameter_budget=None,
+            readout_hidden_size=128,
+            require_router_smaller_than_experts=False,
+        ),
+    )
+    configured.validate()
+    return configured
+
+
+def fast_cnn_balanced_full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = fast_cnn_full(experts_per_family=experts_per_family)
+    configured = replace(
+        experiment,
+        experiment_name="fast_cnn_balanced_full",
+        training=replace(
+            experiment.training,
+            load_balance_coefficient=0.2,
+            within_family_balance_weight=2.0,
+        ),
+    )
+    configured.validate()
+    return configured
+
+
+def fast_cnn_depth5_full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = fast_cnn_balanced_full(experts_per_family=experts_per_family)
+    configured = replace(
+        experiment,
+        experiment_name="fast_cnn_depth5_full",
+        model=replace(
+            experiment.model,
+            min_steps=5,
+            max_steps=6,
+        ),
+        training=replace(
+            experiment.training,
+            epochs=8,
+            batch_size=4_096,
+            learning_rate=3e-3,
+            patience=2,
+        ),
+    )
+    configured.validate()
+    return configured
+
+
+def fast_cnn_depth5_scaled_full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = fast_cnn_depth5_full(experts_per_family=experts_per_family)
+    configured = replace(
+        experiment,
+        experiment_name="fast_cnn_depth5_scaled_full",
+        model=replace(
+            experiment.model,
+            expert_residual_scale=0.1,
+        ),
+        training=replace(
+            experiment.training,
+            load_balance_coefficient=0.5,
+            compute_penalty_coefficient=3.0,
+        ),
+    )
+    configured.validate()
+    return configured
+
+
+def fast_cnn_depth5_curriculum_full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = fast_cnn_depth5_scaled_full(experts_per_family=experts_per_family)
+    configured = replace(
+        experiment,
+        experiment_name="fast_cnn_depth5_curriculum_full",
+        training=replace(
+            experiment.training,
+            epochs=10,
+            patience=3,
+            routing_warmup_epochs=4,
+        ),
+    )
+    configured.validate()
+    return configured
+
+
+def fast_cnn_depth5_shared_router_full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = fast_cnn_depth5_curriculum_full(experts_per_family=experts_per_family)
+    configured = replace(
+        experiment,
+        experiment_name="fast_cnn_depth5_shared_router_full",
+        model=replace(
+            experiment.model,
+            share_router_across_sources=True,
+        ),
+    )
+    configured.validate()
+    return configured
+
+
+def fast_cnn_depth5_sinkhorn_full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = fast_cnn_depth5_shared_router_full(experts_per_family=experts_per_family)
+    configured = replace(
+        experiment,
+        experiment_name="fast_cnn_depth5_sinkhorn_full",
+        model=replace(
+            experiment.model,
+            sinkhorn_routing_iterations=100,
+            sinkhorn_temperature=0.05,
+        ),
+    )
+    configured.validate()
+    return configured
+
+
+def fast_cnn_depth5_capacity_full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = fast_cnn_depth5_sinkhorn_full(experts_per_family=experts_per_family)
+    configured = replace(
+        experiment,
+        experiment_name="fast_cnn_depth5_capacity_full",
+        model=replace(
+            experiment.model,
+            capacity_balanced_evaluation=True,
+        ),
+    )
+    configured.validate()
+    return configured
+
+
 def focused(*, experts_per_family: int = 8) -> ExperimentConfig:
     experiment = pilot(experts_per_family=experts_per_family)
     return replace(
@@ -201,6 +360,15 @@ MNIST_PRESETS = {
     "pilot": pilot,
     "full": full,
     "diverse_full": diverse_full,
+    "fast_full": fast_full,
+    "fast_cnn_full": fast_cnn_full,
+    "fast_cnn_balanced_full": fast_cnn_balanced_full,
+    "fast_cnn_depth5_full": fast_cnn_depth5_full,
+    "fast_cnn_depth5_scaled_full": fast_cnn_depth5_scaled_full,
+    "fast_cnn_depth5_curriculum_full": fast_cnn_depth5_curriculum_full,
+    "fast_cnn_depth5_shared_router_full": fast_cnn_depth5_shared_router_full,
+    "fast_cnn_depth5_sinkhorn_full": fast_cnn_depth5_sinkhorn_full,
+    "fast_cnn_depth5_capacity_full": fast_cnn_depth5_capacity_full,
     "focused": focused,
 }
 MNIST_PRESET_NAMES = tuple(MNIST_PRESETS)

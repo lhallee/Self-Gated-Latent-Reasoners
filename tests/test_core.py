@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 import torch
 import torch.nn as nn
+
+from collections.abc import Callable
+from dataclasses import replace
 
 from sglr.config import ExpertSpec, ModelConfig
 from sglr.experts import ExpertDelta, build_expert
@@ -13,9 +14,11 @@ from sglr.presets.mnist import get_mnist_preset
 from sglr.router import (
     RouterHead,
     RoutingTrace,
+    capacity_balanced_routes,
     hierarchical_load_balancing_loss,
     masked_mean,
     routing_mutual_information,
+    sinkhorn_balanced_probabilities,
 )
 
 
@@ -90,6 +93,36 @@ def test_hierarchical_switch_loss_reaches_soft_router_probabilities() -> None:
     assert torch.count_nonzero(expert_probs.grad) > 0
 
 
+def test_sinkhorn_probabilities_have_balanced_column_mass_and_gradients() -> None:
+    torch.manual_seed(13)
+    router_logits = torch.randn(96, 24, requires_grad=True)  # (b, e)
+
+    route_probs = sinkhorn_balanced_probabilities(
+        router_logits,
+        iterations=100,
+        temperature=0.05,
+    )  # (b, e)
+    column_mass = route_probs.sum(dim=0)  # (e,)
+    route_probs.square().sum().backward()
+
+    assert torch.allclose(route_probs.sum(dim=-1), torch.ones(96), atol=1e-6)
+    assert torch.allclose(column_mass, torch.full((24,), 4.0), atol=0.1)
+    assert router_logits.grad is not None
+    assert torch.count_nonzero(router_logits.grad) > 0
+
+
+def test_capacity_balanced_routes_use_equal_expert_quotas() -> None:
+    torch.manual_seed(19)
+    route_scores = torch.randn(101, 24)  # (b, e)
+
+    route_ids = capacity_balanced_routes(route_scores)  # (b,)
+    route_counts = torch.bincount(route_ids, minlength=24)  # (e,)
+
+    assert route_ids.shape == (101,)
+    assert int(route_counts.min()) == 4
+    assert int(route_counts.max()) == 5
+
+
 def test_route_mutual_information_rewards_different_orders_between_examples() -> None:
     diverse_routes = torch.tensor([[0, 1], [1, 0]])
     diverse_probs = nn.functional.one_hot(diverse_routes, 3).to(torch.float32)
@@ -160,6 +193,29 @@ def test_zero_delta_expert_is_exact_identity() -> None:
     assert torch.equal(hidden_states + expert(hidden_states), hidden_states)
 
 
+def test_sparse_expert_update_applies_configured_residual_scale() -> None:
+    config = replace(
+        small_config("hard_argmax"),
+        max_steps=1,
+        expert_residual_scale=0.25,
+    )
+    core = SGLRCore(config).eval()
+    with torch.no_grad():
+        initial_router = core.routers[core.initial_router_index]
+        initial_router.input_projection.weight.zero_()
+        initial_router.input_projection.bias.zero_()
+        initial_router.output_projection.weight.zero_()
+        initial_router.output_projection.bias.copy_(
+            torch.tensor([10.0, -10.0, -10.0, -10.0])  # (e + 1,)
+        )
+        hidden_states = torch.randn(3, 6, config.hidden_size)  # (b, l, d)
+        expert_delta = core.experts[0](hidden_states)  # (b, l, d)
+        output = core(hidden_states)
+
+    expected_states = hidden_states + 0.25 * expert_delta  # (b, l, d)
+    assert torch.allclose(output.final_hidden_states, expected_states)
+
+
 def test_convolution_mask_prevents_padded_values_from_leaking() -> None:
     torch.manual_seed(3)
     expert = build_expert(ExpertSpec("conv", "conv", channels=2, kernel_size=(3, 3)), 8)
@@ -184,6 +240,21 @@ def test_router_and_pooling_ignore_masked_tokens() -> None:
 
     assert torch.allclose(masked_mean(first, attention_mask), masked_mean(second, attention_mask))
     assert torch.allclose(router(first, attention_mask), router(second, attention_mask))
+
+
+def test_shared_router_uses_one_head_for_all_recurrent_sources() -> None:
+    config = replace(
+        small_config("hard_argmax"),
+        share_router_across_sources=True,
+    )
+    core = SGLRCore(config)
+    hidden_states = torch.randn(4, 6, config.hidden_size)  # (b, l, d)
+
+    output = core(hidden_states)
+
+    assert len(core.routers) == 1
+    assert core.initial_router_index == 0
+    assert output.trace.num_experts == 3
 
 
 def test_straight_through_classification_loss_reaches_routers() -> None:
@@ -291,6 +362,53 @@ def test_straight_through_and_sparse_forward_states_match() -> None:
     )
 
 
+def test_evaluation_dispatches_only_the_selected_expert() -> None:
+    config = small_config("hard_argmax")
+    core = SGLRCore(replace(config, max_steps=2)).eval()
+    with torch.no_grad():
+        for router in core.routers:
+            router.input_projection.weight.zero_()
+            router.input_projection.bias.zero_()
+            router.output_projection.weight.zero_()
+            router.output_projection.bias.zero_()
+        core.routers[core.initial_router_index].output_projection.bias.copy_(
+            torch.tensor([10.0, -10.0, -10.0, -10.0])  # (e + 1,)
+        )
+        core.routers[0].output_projection.bias.copy_(
+            torch.tensor([-10.0, -10.0, -10.0, 10.0])  # (e + 1,)
+        )
+
+    call_sizes: list[list[int]] = [[] for _ in core.experts]
+
+    def record_call(
+        expert_index: int,
+    ) -> Callable[[nn.Module, tuple[torch.Tensor, ...], torch.Tensor], None]:
+        def hook(
+            _module: nn.Module,
+            inputs: tuple[torch.Tensor, ...],
+            _output: torch.Tensor,
+        ) -> None:
+            hidden_states = inputs[0]  # (n_selected, l, d)
+            call_sizes[expert_index].append(hidden_states.size(0))
+
+        return hook
+
+    handles = [
+        expert.register_forward_hook(record_call(expert_index))
+        for expert_index, expert in enumerate(core.experts)
+    ]
+    hidden_states = torch.randn(5, 6, config.hidden_size)  # (b, l, d)
+    try:
+        output = core(hidden_states)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert call_sizes == [[5], [], []]
+    assert output.trace.route_depth.tolist() == [1, 1, 1, 1, 1]
+    assert output.trace.forced_exit.tolist() == [False, False, False, False, False]
+
+
 def test_primary_and_fixed_depth_parameter_budgets() -> None:
     primary_config = get_mnist_preset("pilot").model
     primary_model = MNISTSGLR(primary_config)
@@ -305,3 +423,15 @@ def test_primary_and_fixed_depth_parameter_budgets() -> None:
     assert router_count < expert_count
     assert abs(fixed_count - primary_count) / primary_count <= 0.02
     assert fixed_model.specs[-1].hidden_size == 360
+
+
+def test_fast_full_encoder_and_readout_preserve_output_contract() -> None:
+    config = get_mnist_preset("fast_cnn_full").model
+    model = MNISTSGLR(config).eval()
+    images = torch.randn(3, 1, 28, 28)  # (b, 1, 28, 28)
+
+    with torch.inference_mode():
+        output = model(images)
+
+    assert output.final_hidden_states.shape == (3, 49, config.hidden_size)
+    assert output.logits.shape == (3, 10)

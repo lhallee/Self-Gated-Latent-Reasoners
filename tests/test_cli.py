@@ -29,6 +29,7 @@ def test_train_parser_accepts_python_preset_and_expert_override() -> None:
             "--device",
             "cpu",
             "--no-progress",
+            "--validation-only",
         ]
     )
     experiment = with_run_overrides(
@@ -42,6 +43,7 @@ def test_train_parser_accepts_python_preset_and_expert_override() -> None:
     assert experiment.training.seed == 17
     assert args.device == "cpu"
     assert args.no_progress
+    assert args.validation_only
 
 
 @pytest.mark.parametrize("value", ["0", "-1"])

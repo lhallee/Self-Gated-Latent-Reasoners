@@ -283,7 +283,7 @@ def plot_depth_and_forced_exit(statistics: RouteStatistics, output_path: str | P
     depth_axis.set(xlabel="Digit", ylabel="Fraction of samples", title="Route-depth distribution")
     depth_axis.set_xticks(DIGITS)
     depth_axis.set_ylim(0.0, 1.0)
-    depth_axis.legend(title="Depth", ncols=min(3, len(depths)), fontsize=8)
+    depth_axis.legend(title="Depth", ncol=min(3, len(depths)), fontsize=8)
 
     forced_axis.bar(DIGITS, statistics.forced_exit_rate, color="#b4474d")
     forced_axis.set(xlabel="Digit", ylabel="Forced-exit rate", title="Forced exits by digit")

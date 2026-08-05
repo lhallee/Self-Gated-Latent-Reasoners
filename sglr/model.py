@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-
 import torch
 import torch.nn as nn
+
+from dataclasses import dataclass, replace
 from torch import Tensor
 
 from sglr.config import ExpertSpec, ModelConfig
 from sglr.experts import build_expert
-from sglr.router import RouterHead, RoutingTrace, masked_mean, straight_through_one_hot
+from sglr.router import (
+    RouterHead,
+    RoutingTrace,
+    capacity_balanced_routes,
+    masked_mean,
+    sinkhorn_balanced_probabilities,
+    straight_through_one_hot,
+)
 
 
 @dataclass(slots=True)
@@ -40,6 +47,7 @@ class SGLRCore(nn.Module):
             [build_expert(spec, config.hidden_size) for spec in config.experts]
         )
         self.expert_names = [spec.name for spec in config.experts]
+        router_count = 1 if config.share_router_across_sources else config.num_experts + 1
         self.routers = nn.ModuleList(
             [
                 RouterHead(
@@ -48,10 +56,10 @@ class SGLRCore(nn.Module):
                     num_routes=config.num_routes,
                     dropout=config.router_dropout,
                 )
-                for _ in range(config.num_experts + 1)
+                for _ in range(router_count)
             ]
         )
-        self.initial_router_index = config.num_experts
+        self.initial_router_index = 0 if config.share_router_across_sources else config.num_experts
 
         if config.routing_mode == "frozen_random":
             for parameter in self.routers.parameters():
@@ -76,6 +84,8 @@ class SGLRCore(nn.Module):
         source_gates: Tensor | None = None,
     ) -> Tensor:
         # hidden_states: (b, l, d); source_ids: (b,); source_gates: (b, e + 1)
+        if self.config.share_router_across_sources:
+            return self.routers[0](hidden_states, attention_mask)  # (b, e + 1)
         if source_gates is None and not self.training:
             return self._sparse_router_logits(hidden_states, attention_mask, source_ids)  # (b, e + 1)
 
@@ -128,7 +138,9 @@ class SGLRCore(nn.Module):
     def _dense_candidates(self, hidden_states: Tensor, attention_mask: Tensor | None) -> Tensor:
         # hidden_states: (b, l, d); attention_mask: (b, l)
         expert_candidates = [
-            hidden_states + expert(hidden_states, attention_mask) for expert in self.experts
+            hidden_states
+            + self.config.expert_residual_scale * expert(hidden_states, attention_mask)
+            for expert in self.experts
         ]  # e * (b, l, d)
         expert_candidates.append(hidden_states)  # exit candidate: (b, l, d)
         return torch.stack(expert_candidates, dim=1)  # (b, e + 1, l, d)
@@ -166,9 +178,12 @@ class SGLRCore(nn.Module):
             selected_attention_mask = (
                 None if attention_mask is None else attention_mask.index_select(0, selected_indices)
             )  # (n_selected, l)
-            selected_candidates = selected_states + self.experts[expert_index](
+            expert_delta = self.experts[expert_index](
                 selected_states,
                 selected_attention_mask,
+            )  # (n_selected, l, d)
+            selected_candidates = (
+                selected_states + self.config.expert_residual_scale * expert_delta
             )  # (n_selected, l, d)
             next_hidden_states = next_hidden_states.index_copy(
                 0,
@@ -231,7 +246,29 @@ class SGLRCore(nn.Module):
                 router_logits = router_logits.masked_fill(exit_mask, minimum_logit)  # (b, e + 1)
 
             route_probs = router_logits.softmax(dim=-1)  # (b, e + 1)
-            hard_routes = route_probs.argmax(dim=-1)  # (b,)
+            if (
+                self.config.sinkhorn_routing_iterations > 0
+                and step_index < self.config.min_steps
+            ):
+                balanced_expert_probs = sinkhorn_balanced_probabilities(
+                    router_logits[:, : self.config.num_experts],
+                    iterations=self.config.sinkhorn_routing_iterations,
+                    temperature=self.config.sinkhorn_temperature,
+                )  # (b, e)
+                route_probs = torch.cat(
+                    [balanced_expert_probs, torch.zeros_like(balanced_expert_probs[:, :1])],
+                    dim=-1,
+                )  # (b, e + 1)
+            if (
+                not self.training
+                and self.config.capacity_balanced_evaluation
+                and step_index < self.config.min_steps
+            ):
+                hard_routes = capacity_balanced_routes(
+                    route_probs[:, : self.config.num_experts]
+                )  # (b,)
+            else:
+                hard_routes = route_probs.argmax(dim=-1)  # (b,)
             selected_routes = torch.where(
                 sample_is_active,
                 hard_routes,
@@ -319,12 +356,29 @@ class MNISTPatchEncoder(nn.Module):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_size
-        self.patch_projection = nn.Conv2d(
-            1,
-            config.hidden_size,
-            kernel_size=config.patch_size,
-            stride=config.patch_size,
-        )
+        if config.encoder_width:
+            width = config.encoder_width
+            self.patch_projection = nn.Sequential(
+                nn.Conv2d(1, width, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(width, 2 * width, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+                nn.Conv2d(
+                    2 * width,
+                    config.hidden_size,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                ),
+                nn.GELU(),
+            )
+        else:
+            self.patch_projection = nn.Conv2d(
+                1,
+                config.hidden_size,
+                kernel_size=config.patch_size,
+                stride=config.patch_size,
+            )
         self.position_embeddings = nn.Parameter(
             torch.empty(1, config.num_patches, config.hidden_size)
         )  # (1, 49, d)
@@ -346,7 +400,18 @@ class MNISTSGLR(nn.Module):
         self.encoder = MNISTPatchEncoder(config)
         self.core = SGLRCore(config)
         self.decision_norm = nn.LayerNorm(config.hidden_size)
-        self.classifier = nn.Linear(config.hidden_size, config.num_classes)
+        self.readout_hidden_size = config.readout_hidden_size
+        if self.readout_hidden_size:
+            self.classifier = nn.Sequential(
+                nn.Linear(
+                    config.num_patches * config.hidden_size,
+                    self.readout_hidden_size,
+                ),
+                nn.GELU(),
+                nn.Linear(self.readout_hidden_size, config.num_classes),
+            )
+        else:
+            self.classifier = nn.Linear(config.hidden_size, config.num_classes)
 
     @property
     def expert_names(self) -> list[str]:
@@ -360,8 +425,11 @@ class MNISTSGLR(nn.Module):
         hidden_states = self.encoder(images)  # (b, 49, d)
         core_output = self.core(hidden_states)  # (b, 49, d)
         normalized_states = self.decision_norm(core_output.final_hidden_states)  # (b, 49, d)
-        pooled_states = masked_mean(normalized_states, attention_mask=None)  # (b, d)
-        logits = self.classifier(pooled_states)  # (b, 10)
+        if self.readout_hidden_size:
+            readout_states = normalized_states.flatten(start_dim=1)  # (b, 49 * d)
+        else:
+            readout_states = masked_mean(normalized_states, attention_mask=None)  # (b, d)
+        logits = self.classifier(readout_states)  # (b, 10)
         return MNISTOutput(logits, core_output.final_hidden_states, core_output.trace)
 
 
