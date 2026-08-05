@@ -21,13 +21,13 @@ logits (b, 10)
 At recurrent step `t`, the router associated with the current source pools the tokens and predicts one of 24 experts or the exit action. There is one initial router and one router after each expert, so self-loops and transitions to every other expert are available:
 
 \[
-p_t = \operatorname{softmax}(R_{\operatorname{source}(t)}(\operatorname{pool}(X_t))).
+p_t = \mathrm{softmax}(R_{\mathrm{source}(t)}(\mathrm{pool}(X_t))).
 \]
 
 If expert `e` is selected, it produces a delta with the same shape as its input. The recurrent core owns the only residual update:
 
 \[
-\Delta_t = E_e(\operatorname{LayerNorm}(X_t)), \qquad
+\Delta_t = E_e(\mathrm{LayerNorm}(X_t)), \qquad
 X_{t+1} = X_t + \Delta_t.
 \]
 
