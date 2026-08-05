@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 EXPERT_FAMILIES = {"mlp", "conv", "attention"}
 ROUTING_MODES = {"straight_through", "hard_argmax", "frozen_random", "fixed_depth"}
 
@@ -122,6 +122,8 @@ class TrainingConfig:
     warmup_fraction: float = 0.05
     grad_accum_steps: int = 1
     load_balance_coefficient: float = 0.01
+    within_family_balance_weight: float = 1.0
+    route_mi_coefficient: float = 0.0
     compute_penalty_coefficient: float = 0.005
     patience: int = 3
     train_size: int = 12_000
@@ -154,7 +156,13 @@ class TrainingConfig:
             raise ValueError("warmup_fraction must be in [0, 1)")
         if self.weight_decay < 0.0:
             raise ValueError("weight_decay must be non-negative")
-        if self.load_balance_coefficient < 0.0 or self.compute_penalty_coefficient < 0.0:
+        auxiliary_coefficients = (
+            self.load_balance_coefficient,
+            self.within_family_balance_weight,
+            self.route_mi_coefficient,
+            self.compute_penalty_coefficient,
+        )
+        if any(coefficient < 0.0 for coefficient in auxiliary_coefficients):
             raise ValueError("Auxiliary loss coefficients must be non-negative")
 
 

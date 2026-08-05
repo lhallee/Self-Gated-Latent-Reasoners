@@ -31,7 +31,11 @@ from sglr.config import ExperimentConfig
 from sglr.data import MNISTDataLoaders, build_mnist_loaders
 from sglr.evaluation import evaluate_model
 from sglr.model import MNISTOutput, build_mnist_model, count_parameters
-from sglr.router import compute_penalty, load_balancing_loss
+from sglr.router import (
+    compute_penalty,
+    hierarchical_load_balancing_loss,
+    routing_mutual_information,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +43,7 @@ class EpochMetrics:
     loss: float
     cross_entropy: float
     load_balance: float
+    route_mutual_information: float
     compute_penalty: float
     accuracy: float
     mean_route_depth: float
@@ -96,11 +101,19 @@ def build_scheduler(
 def _auxiliary_losses(
     output: MNISTOutput,
     variant: str,
-) -> tuple[Tensor, Tensor]:
+    expert_families: tuple[str, ...],
+    within_family_balance_weight: float,
+) -> tuple[Tensor, Tensor, Tensor]:
     zero = output.logits.sum() * 0.0  # ()
     if variant in {"fixed_depth", "frozen_random"}:
-        return zero, zero
-    return load_balancing_loss(output.trace), compute_penalty(output.trace)
+        return zero, zero, zero
+    balance = hierarchical_load_balancing_loss(
+        output.trace,
+        expert_families,
+        within_family_balance_weight,
+    )  # ()
+    route_information = routing_mutual_information(output.trace)  # ()
+    return balance, route_information, compute_penalty(output.trace)
 
 
 def run_epoch(
@@ -108,7 +121,10 @@ def run_epoch(
     data_loader: DataLoader,
     device: torch.device,
     variant: str,
+    expert_families: tuple[str, ...],
     load_balance_coefficient: float,
+    within_family_balance_weight: float,
+    route_mi_coefficient: float,
     compute_penalty_coefficient: float,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
@@ -123,7 +139,7 @@ def run_epoch(
         optimizer.zero_grad(set_to_none=True)
 
     total_examples = 0
-    metric_totals = torch.zeros(6, device=device, dtype=torch.float32)  # (6,)
+    metric_totals = torch.zeros(7, device=device, dtype=torch.float32)  # (7,)
     total_batches = len(data_loader)
 
     batches = tqdm(
@@ -144,10 +160,16 @@ def run_epoch(
             if not isinstance(output, MNISTOutput):
                 raise TypeError("MNIST training expects the model to return MNISTOutput")
             cross_entropy = F.cross_entropy(output.logits, labels)  # ()
-            balance_loss, depth_loss = _auxiliary_losses(output, variant)
+            balance_loss, route_information, depth_loss = _auxiliary_losses(
+                output,
+                variant,
+                expert_families,
+                within_family_balance_weight,
+            )
             loss = (
                 cross_entropy
                 + load_balance_coefficient * balance_loss
+                - route_mi_coefficient * route_information
                 + compute_penalty_coefficient * depth_loss
             )  # ()
 
@@ -171,12 +193,13 @@ def run_epoch(
                 loss.detach() * b,
                 cross_entropy.detach() * b,
                 balance_loss.detach() * b,
+                route_information.detach() * b,
                 depth_loss.detach() * b,
                 predictions.eq(labels).sum(),
                 output.trace.route_depth.sum(),
             )
-        )  # (6,)
-        metric_totals += batch_metric_totals  # (6,)
+        )  # (7,)
+        metric_totals += batch_metric_totals  # (7,)
 
         should_report = (
             batch_index == 0
@@ -189,6 +212,8 @@ def run_epoch(
                 "loss": f"{current_metrics.loss:.4f}",
                 "acc": f"{current_metrics.accuracy:.3f}",
                 "depth": f"{current_metrics.mean_route_depth:.2f}",
+                "balance": f"{current_metrics.load_balance:.3f}",
+                "route_mi": f"{current_metrics.route_mutual_information:.3f}",
             }
             if training:
                 postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
@@ -206,12 +231,21 @@ def run_epoch(
 
 
 def _epoch_metrics(metric_totals: Tensor, total_examples: int) -> EpochMetrics:
-    # metric_totals: (6,)
-    loss, cross_entropy, load_balance, compute_penalty, correct, route_depth = metric_totals.tolist()
+    # metric_totals: (7,)
+    (
+        loss,
+        cross_entropy,
+        load_balance,
+        route_information,
+        compute_penalty,
+        correct,
+        route_depth,
+    ) = metric_totals.tolist()
     return EpochMetrics(
         loss=loss / total_examples,
         cross_entropy=cross_entropy / total_examples,
         load_balance=load_balance / total_examples,
+        route_mutual_information=route_information / total_examples,
         compute_penalty=compute_penalty / total_examples,
         accuracy=correct / total_examples,
         mean_route_depth=route_depth / total_examples,
@@ -227,6 +261,7 @@ def train_model(
     show_progress: bool = False,
 ) -> TrainingResult:
     config = experiment.training
+    expert_families = tuple(spec.family for spec in experiment.model.experts)
     report = tqdm.write if show_progress else print
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(
@@ -294,7 +329,10 @@ def train_model(
             data_loader=loaders.train,
             device=device,
             variant=experiment.model.routing_mode,
+            expert_families=expert_families,
             load_balance_coefficient=config.load_balance_coefficient,
+            within_family_balance_weight=config.within_family_balance_weight,
+            route_mi_coefficient=config.route_mi_coefficient,
             compute_penalty_coefficient=config.compute_penalty_coefficient,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -308,7 +346,10 @@ def train_model(
             data_loader=loaders.validation,
             device=device,
             variant=experiment.model.routing_mode,
+            expert_families=expert_families,
             load_balance_coefficient=config.load_balance_coefficient,
+            within_family_balance_weight=config.within_family_balance_weight,
+            route_mi_coefficient=config.route_mi_coefficient,
             compute_penalty_coefficient=config.compute_penalty_coefficient,
             description=f"Validate {epoch}/{config.epochs}",
             show_progress=show_progress,

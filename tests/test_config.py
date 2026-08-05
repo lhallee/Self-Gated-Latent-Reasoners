@@ -15,7 +15,7 @@ from sglr.presets.mnist import MNIST_PRESET_NAMES, get_mnist_preset, make_expert
 def test_experiment_presets_are_valid(preset_name: str) -> None:
     experiment = get_mnist_preset(preset_name)
 
-    assert experiment.schema_version == 3
+    assert experiment.schema_version == 4
     assert experiment.model.num_experts == 24
     assert experiment.model.hidden_size == 48
 
@@ -28,6 +28,18 @@ def test_full_preset_uses_all_training_images_and_seals_half_the_test_split() ->
     assert experiment.training.validation_size == 5_000
     assert experiment.training.test_size == 5_000
     assert experiment.training.validation_source == "official_test"
+
+
+def test_diverse_full_preset_enables_hierarchical_balance_and_route_information() -> None:
+    experiment = get_mnist_preset("diverse_full")
+
+    assert experiment.experiment_name == "diverse_full"
+    assert experiment.model.max_steps == 20
+    assert experiment.training.batch_size == 256
+    assert experiment.training.load_balance_coefficient == 0.03
+    assert experiment.training.within_family_balance_weight == 1.0
+    assert experiment.training.route_mi_coefficient == 0.1
+    assert experiment.training.compute_penalty_coefficient == 0.025
 
 
 def test_primary_expert_order_is_stable() -> None:
@@ -97,7 +109,7 @@ def test_manifest_configuration_round_trip() -> None:
 
 
 def test_unknown_preset_lists_valid_names() -> None:
-    with pytest.raises(ValueError, match="smoke, pilot, full, focused"):
+    with pytest.raises(ValueError, match="smoke, pilot, full, diverse_full, focused"):
         get_mnist_preset("unknown")
 
 

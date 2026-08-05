@@ -52,7 +52,10 @@ def test_single_batch_training_with_accumulation_one() -> None:
         data_loader=sample_loader(),
         device=torch.device("cpu"),
         variant="straight_through",
+        expert_families=tuple(spec.family for spec in model.config.experts),
         load_balance_coefficient=0.01,
+        within_family_balance_weight=1.0,
+        route_mi_coefficient=0.01,
         compute_penalty_coefficient=0.001,
         optimizer=optimizer,
         grad_accum_steps=1,
@@ -61,6 +64,8 @@ def test_single_batch_training_with_accumulation_one() -> None:
     assert metrics.loss > 0.0
     assert 0.0 <= metrics.accuracy <= 1.0
     assert metrics.mean_route_depth >= 1.0
+    assert metrics.load_balance >= 0.0
+    assert metrics.route_mutual_information >= 0.0
 
 
 def test_training_progress_reports_live_metrics(capsys: pytest.CaptureFixture[str]) -> None:
@@ -72,7 +77,10 @@ def test_training_progress_reports_live_metrics(capsys: pytest.CaptureFixture[st
         data_loader=sample_loader(),
         device=torch.device("cpu"),
         variant="straight_through",
+        expert_families=tuple(spec.family for spec in model.config.experts),
         load_balance_coefficient=0.01,
+        within_family_balance_weight=1.0,
+        route_mi_coefficient=0.01,
         compute_penalty_coefficient=0.001,
         optimizer=optimizer,
         description="Train 1/1",
@@ -84,6 +92,8 @@ def test_training_progress_reports_live_metrics(capsys: pytest.CaptureFixture[st
     assert "loss=" in progress_output
     assert "acc=" in progress_output
     assert "depth=" in progress_output
+    assert "balance=" in progress_output
+    assert "route_mi=" in progress_output
     assert "lr=" in progress_output
 
 

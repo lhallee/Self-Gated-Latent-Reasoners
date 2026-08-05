@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from sglr.config import ExpertSpec, ModelConfig
 from sglr.model import MNISTSGLR, count_parameters
-from sglr.router import compute_penalty, load_balancing_loss
+from sglr.router import compute_penalty, hierarchical_load_balancing_loss
 
 
 def smoke_config() -> ModelConfig:
@@ -29,7 +29,8 @@ def smoke_config() -> ModelConfig:
 def main() -> None:
     start = time.perf_counter()
     torch.manual_seed(7)
-    model = MNISTSGLR(smoke_config())
+    config = smoke_config()
+    model = MNISTSGLR(config)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     router_received_gradient = False
 
@@ -37,9 +38,13 @@ def main() -> None:
         images = torch.randn(8, 1, 28, 28)  # (b, 1, 28, 28)
         labels = torch.randint(0, 10, (8,))  # (b,)
         output = model(images)
+        balance_loss = hierarchical_load_balancing_loss(
+            output.trace,
+            tuple(spec.family for spec in config.experts),
+        )  # ()
         loss = (
             F.cross_entropy(output.logits, labels)
-            + 0.01 * load_balancing_loss(output.trace)
+            + 0.01 * balance_loss
             + 0.001 * compute_penalty(output.trace)
         )  # ()
         optimizer.zero_grad(set_to_none=True)

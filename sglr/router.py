@@ -69,19 +69,113 @@ def straight_through_one_hot(route_probs: Tensor) -> tuple[Tensor, Tensor]:
     return gates, route_ids
 
 
-def load_balancing_loss(trace: RoutingTrace) -> Tensor:
-    """Balance expert probabilities while leaving termination unconstrained."""
-    # trace.route_probs: (s, b, e + 1); trace.active_mask: (s, b)
-    expert_probs = trace.route_probs[..., : trace.num_experts]  # (s, b, e)
-    active_expert_probs = expert_probs[trace.active_mask]  # (n_active, e)
-    if active_expert_probs.numel() == 0:
+def hierarchical_load_balancing_loss(
+    trace: RoutingTrace,
+    expert_families: tuple[str, ...],
+    within_family_weight: float = 1.0,
+) -> Tensor:
+    """Balance hard and soft utilization across families and experts."""
+
+    if len(expert_families) != trace.num_experts:
+        raise ValueError("expert_families must contain one entry per expert")
+    if within_family_weight < 0.0:
+        raise ValueError("within_family_weight must be non-negative")
+
+    # trace.route_probs: (s, b, e + 1); trace.route_ids: (s, b)
+    selected_expert = trace.active_mask & trace.route_ids.ge(0) & trace.route_ids.lt(trace.num_experts)  # (s, b)
+    selected_routes = trace.route_ids[selected_expert]  # (n_selected,)
+    selected_probs = trace.route_probs[..., : trace.num_experts][selected_expert]  # (n_selected, e)
+    if selected_routes.numel() == 0:
         return trace.route_probs.sum() * 0.0  # ()
 
-    expert_probability_mass = active_expert_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)  # (n_active, 1)
-    conditional_probs = active_expert_probs / expert_probability_mass  # (n_active, e)
-    mean_expert_probs = conditional_probs.mean(dim=0)  # (e,)
-    uniform_target = torch.full_like(mean_expert_probs, 1.0 / trace.num_experts)  # (e,)
-    return torch.mean((mean_expert_probs - uniform_target) ** 2)  # ()
+    conditional_probs = selected_probs / selected_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)  # (n_selected, e)
+    family_names = tuple(dict.fromkeys(expert_families))
+    family_ids = torch.tensor(
+        [family_names.index(family) for family in expert_families],
+        device=trace.route_probs.device,
+        dtype=torch.long,
+    )  # (e,)
+    selected_family_ids = family_ids.index_select(0, selected_routes)  # (n_selected,)
+    family_probs = torch.stack(
+        [conditional_probs[:, family_ids.eq(family_id)].sum(dim=-1) for family_id in range(len(family_names))],
+        dim=-1,
+    )  # (n_selected, f)
+    family_loss = _switch_balance(family_probs, selected_family_ids)  # ()
+
+    within_family_losses: list[Tensor] = []
+    represented_families: list[Tensor] = []
+    for family_id in range(len(family_names)):
+        family_expert_indices = torch.nonzero(family_ids.eq(family_id), as_tuple=False).flatten()  # (e_family,)
+        family_selected = selected_family_ids.eq(family_id)  # (n_selected,)
+        family_count = family_selected.sum()  # ()
+        local_probs = conditional_probs.index_select(1, family_expert_indices)  # (n_selected, e_family)
+        local_probs = local_probs / local_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)  # (n_selected, e_family)
+        selected_local_probs = local_probs * family_selected.unsqueeze(-1)  # (n_selected, e_family)
+        soft_fraction = selected_local_probs.sum(dim=0) / family_count.clamp_min(1)  # (e_family,)
+        hard_counts = selected_routes.unsqueeze(-1).eq(family_expert_indices).sum(dim=0)  # (e_family,)
+        hard_fraction = hard_counts.to(conditional_probs.dtype) / family_count.clamp_min(1)  # (e_family,)
+        family_size = family_expert_indices.numel()
+        within_family_losses.append(family_size * torch.sum(hard_fraction * soft_fraction))
+        represented_families.append(family_count.gt(0).to(conditional_probs.dtype))
+
+    if within_family_weight == 0.0:
+        return family_loss  # ()
+    family_presence = torch.stack(represented_families)  # (f,)
+    mean_within_family_loss = (
+        torch.stack(within_family_losses) * family_presence
+    ).sum() / family_presence.sum().clamp_min(1.0)  # ()
+    return (
+        family_loss + within_family_weight * mean_within_family_loss
+    ) / (1.0 + within_family_weight)  # ()
+
+
+def _switch_balance(conditional_probs: Tensor, hard_routes: Tensor) -> Tensor:
+    # conditional_probs: (n, r); hard_routes: (n,)
+    num_routes = conditional_probs.size(-1)
+    hard_assignments = torch.nn.functional.one_hot(hard_routes, num_routes).to(conditional_probs.dtype)  # (n, r)
+    hard_fraction = hard_assignments.mean(dim=0)  # (r,)
+    soft_fraction = conditional_probs.mean(dim=0)  # (r,)
+    return num_routes * torch.sum(hard_fraction * soft_fraction)  # ()
+
+
+def routing_mutual_information(trace: RoutingTrace) -> Tensor:
+    """Measure confident, input-dependent expert choices at each recurrent step."""
+
+    # trace.route_probs: (s, b, e + 1); trace.route_ids: (s, b)
+    step_information: list[Tensor] = []
+    selected_counts: list[int] = []
+    for step_index in range(trace.executed_steps):
+        selected_expert = (
+            trace.active_mask[step_index]
+            & trace.route_ids[step_index].ge(0)
+            & trace.route_ids[step_index].lt(trace.num_experts)
+        )  # (b,)
+        step_probs = trace.route_probs[step_index, selected_expert, : trace.num_experts]  # (n_selected, e)
+        if step_probs.size(0) < 2:
+            continue
+
+        conditional_probs = step_probs / step_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)  # (n_selected, e)
+        per_example_entropy = _entropy(conditional_probs).mean()  # ()
+        marginal_probs = conditional_probs.mean(dim=0)  # (e,)
+        marginal_entropy = _entropy(marginal_probs)  # ()
+        step_information.append(marginal_entropy - per_example_entropy)
+        selected_counts.append(step_probs.size(0))
+
+    if not step_information:
+        return trace.route_probs.sum() * 0.0  # ()
+    information_by_step = torch.stack(step_information)  # (n_steps,)
+    step_weights = torch.tensor(
+        selected_counts,
+        device=trace.route_probs.device,
+        dtype=trace.route_probs.dtype,
+    )  # (n_steps,)
+    return torch.sum(information_by_step * step_weights) / step_weights.sum()  # ()
+
+
+def _entropy(probabilities: Tensor) -> Tensor:
+    # probabilities: (..., e)
+    safe_probabilities = probabilities.clamp_min(torch.finfo(probabilities.dtype).tiny)  # (..., e)
+    return -(probabilities * safe_probabilities.log()).sum(dim=-1)  # (...,)
 
 
 def compute_penalty(trace: RoutingTrace) -> Tensor:

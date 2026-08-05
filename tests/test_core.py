@@ -10,7 +10,13 @@ from sglr.config import ExpertSpec, ModelConfig
 from sglr.experts import ExpertDelta, build_expert
 from sglr.model import MNISTSGLR, SGLRCore, build_mnist_model, count_parameters
 from sglr.presets.mnist import get_mnist_preset
-from sglr.router import RouterHead, masked_mean
+from sglr.router import (
+    RouterHead,
+    RoutingTrace,
+    hierarchical_load_balancing_loss,
+    masked_mean,
+    routing_mutual_information,
+)
 
 
 def small_config(routing_mode: str = "straight_through") -> ModelConfig:
@@ -26,6 +32,92 @@ def small_config(routing_mode: str = "straight_through") -> ModelConfig:
             ExpertSpec("attention", "attention", internal_size=8, num_heads=1),
         ),
     )
+
+
+def routing_trace(route_ids: torch.Tensor, route_probs: torch.Tensor) -> RoutingTrace:
+    # route_ids: (s, b); route_probs: (s, b, e + 1)
+    s, b = route_ids.shape
+    num_experts = route_probs.size(-1) - 1
+    return RoutingTrace(
+        route_ids=route_ids,
+        route_probs=route_probs,
+        active_mask=route_ids.ge(0),
+        exit_step=torch.full((b,), s, dtype=torch.long),
+        route_depth=route_ids.lt(num_experts).sum(dim=0),
+        forced_exit=torch.zeros(b, dtype=torch.bool),
+        executed_steps=s,
+        num_experts=num_experts,
+        exit_route_index=num_experts,
+    )
+
+
+def test_hierarchical_switch_loss_uses_hard_assignments_and_excludes_exit() -> None:
+    expert_families = ("mlp", "mlp", "conv", "conv", "attention", "attention")
+    balanced_routes = torch.tensor([[0, 1, 2, 3, 4, 5, 6]])
+    balanced_probs = nn.functional.one_hot(balanced_routes, 7).to(torch.float32)
+    balanced = routing_trace(balanced_routes, balanced_probs)
+
+    collapsed_routes = torch.tensor([[0, 0, 0, 0, 0, 0]])
+    collapsed_probs = nn.functional.one_hot(collapsed_routes, 7).to(torch.float32)
+    collapsed = routing_trace(collapsed_routes, collapsed_probs)
+
+    balanced_loss = hierarchical_load_balancing_loss(balanced, expert_families)
+    collapsed_loss = hierarchical_load_balancing_loss(collapsed, expert_families)
+
+    assert torch.allclose(balanced_loss, torch.tensor(1.0))
+    assert collapsed_loss > balanced_loss
+
+
+def test_hierarchical_switch_loss_reaches_soft_router_probabilities() -> None:
+    route_ids = torch.tensor([[0, 0, 2, 2]])
+    expert_probs = torch.tensor(
+        [
+            [
+                [0.70, 0.10, 0.10, 0.10],
+                [0.60, 0.10, 0.20, 0.10],
+                [0.20, 0.10, 0.60, 0.10],
+                [0.10, 0.10, 0.70, 0.10],
+            ]
+        ],
+        requires_grad=True,
+    )
+    trace = routing_trace(route_ids, expert_probs)
+
+    loss = hierarchical_load_balancing_loss(trace, ("mlp", "mlp", "conv"))
+    loss.backward()
+
+    assert expert_probs.grad is not None
+    assert torch.count_nonzero(expert_probs.grad) > 0
+
+
+def test_route_mutual_information_rewards_different_orders_between_examples() -> None:
+    diverse_routes = torch.tensor([[0, 1], [1, 0]])
+    diverse_probs = nn.functional.one_hot(diverse_routes, 3).to(torch.float32)
+    same_routes = torch.tensor([[0, 0], [1, 1]])
+    same_probs = nn.functional.one_hot(same_routes, 3).to(torch.float32)
+
+    diverse_information = routing_mutual_information(routing_trace(diverse_routes, diverse_probs))
+    same_information = routing_mutual_information(routing_trace(same_routes, same_probs))
+
+    assert diverse_information > 0.0
+    assert torch.allclose(same_information, torch.tensor(0.0))
+
+
+def test_route_mutual_information_reaches_soft_router_probabilities() -> None:
+    route_ids = torch.tensor([[0, 1], [1, 0]])
+    route_probs = torch.tensor(
+        [
+            [[0.80, 0.15, 0.05], [0.20, 0.75, 0.05]],
+            [[0.25, 0.70, 0.05], [0.85, 0.10, 0.05]],
+        ],
+        requires_grad=True,
+    )
+    information = routing_mutual_information(routing_trace(route_ids, route_probs))
+
+    information.backward()
+
+    assert route_probs.grad is not None
+    assert torch.count_nonzero(route_probs.grad) > 0
 
 
 @pytest.mark.parametrize(

@@ -166,6 +166,27 @@ def full(*, experts_per_family: int = 8) -> ExperimentConfig:
     )
 
 
+def diverse_full(*, experts_per_family: int = 8) -> ExperimentConfig:
+    experiment = full(experts_per_family=experts_per_family)
+    configured = replace(
+        experiment,
+        experiment_name="diverse_full",
+        model=replace(experiment.model, max_steps=20),
+        training=replace(
+            experiment.training,
+            epochs=15,
+            patience=4,
+            learning_rate=1e-3,
+            load_balance_coefficient=0.03,
+            within_family_balance_weight=1.0,
+            route_mi_coefficient=0.1,
+            compute_penalty_coefficient=0.025,
+        ),
+    )
+    configured.validate()
+    return configured
+
+
 def focused(*, experts_per_family: int = 8) -> ExperimentConfig:
     experiment = pilot(experts_per_family=experts_per_family)
     return replace(
@@ -179,6 +200,7 @@ MNIST_PRESETS = {
     "smoke": smoke,
     "pilot": pilot,
     "full": full,
+    "diverse_full": diverse_full,
     "focused": focused,
 }
 MNIST_PRESET_NAMES = tuple(MNIST_PRESETS)

@@ -89,7 +89,65 @@ it into an existing run directory.
 
 The functions in `sglr/presets/mnist.py` are the source of the common model,
 expert-pool, optimizer, and data settings. Available preset names are `smoke`,
-`pilot`, `full`, and `focused`.
+`pilot`, `full`, `diverse_full`, and `focused`.
+
+### Hierarchical balance and route diversity run
+
+`diverse_full` is the first preset that jointly enables the hierarchical
+hard-soft Switch loss and per-step routing mutual information:
+
+```python
+TrainingConfig(
+    load_balance_coefficient=0.03,
+    within_family_balance_weight=1.0,
+    route_mi_coefficient=0.1,
+    compute_penalty_coefficient=0.025,
+)
+```
+
+The balancing objective first balances hard and soft utilization across MLP,
+convolution, and attention families, then balances experts within every
+represented family. Exit decisions are excluded. The two levels are normalized
+so a balanced loss is approximately one regardless of the family weight.
+
+Routing mutual information is calculated independently at each recurrent step:
+
+```text
+MI = entropy(mean expert probability across examples)
+     - mean entropy(per-example expert probability)
+```
+
+The training objective subtracts `route_mi_coefficient * MI`, rewarding
+confident per-example choices that remain diverse across the batch. Calculating
+it per step means two examples taking opposite expert orders receive a reward,
+while a batch following one shared order does not receive diversity merely
+because different steps use different experts. Exit is again excluded.
+
+The prepared full-data command is:
+
+```bash
+python -m scripts.train_mnist \
+  --preset diverse_full \
+  --variant straight_through \
+  --seed 7 \
+  --device cuda
+```
+
+This command trains on all 60,000 official training images, uses one stratified
+5,000-image half of the official test split for early stopping, and evaluates
+the disjoint 5,000-image held-out half after training. Give coefficient sweeps
+distinct preset and experiment names; do not repeatedly evaluate the held-out
+partition while tuning.
+
+Progress bars report the raw hierarchical balance and routing mutual
+information values. Compare their weighted contributions with cross-entropy
+rather than comparing coefficients alone.
+
+On the initial 24-expert CUDA calibration batch, router gradient norms were
+`0.0350` for classification, `0.0881` for unweighted hierarchical balance, and
+`0.0217` for unweighted routing MI. The configured coefficients yield initial
+weighted norms of approximately `0.00264` for balance and `0.00217` for routing
+MI, so both auxiliary signals are material without dominating classification.
 
 Use `make_expert_pool()` to construct a heterogeneous pool without listing every
 expert:
